@@ -134,7 +134,7 @@ async function requestOpenAI({ base64Image, extraData, prompt, signal }) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'gpt-4-vision',
+        model: 'gpt-4o',
         messages: [
           {
             role: 'user',
