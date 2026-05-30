@@ -5,7 +5,7 @@ import os from 'os';
 import fetch from 'node-fetch';
 
 import { analyzeChart as analyzeChartGPT }      from './services/chatgpt.js';
-import { analyzeChart as analyzeChartClaude }   from './services/claude.js';
+import { analyzeChart as analyzeChartGemini }   from './services/gemini.js';
 import { analyzeChartWithOpenRouter }            from './services/openrouter.js';
 import { getBitcoinMarketContext }               from './services/marketData.js';
 import { extractChartText }                      from './services/ocr.js';
@@ -95,9 +95,11 @@ async function downloadFile(fileId) {
   return tmpPath;
 }
 
-// ─── AI provider chain: GPT → Claude → OpenRouter ───────────────────────────
+// ─── AI provider chain: GPT → Gemini → OpenRouter ───────────────────────────
 
 async function analyzeWithFallbacks(imagePath, payload, statusId, chatId) {
+  const errors = [];
+
   // 1️⃣ GPT primary
   if (process.env.OPENAI_API_KEY) {
     try {
@@ -106,35 +108,41 @@ async function analyzeWithFallbacks(imagePath, payload, statusId, chatId) {
       result.provider = 'ChatGPT';
       return result;
     } catch (err) {
-      console.error('[bot] ChatGPT failed:', err.message);
-      // fall through
+      console.error('[bot] ChatGPT failed:', err.statusCode, err.message);
+      errors.push(`GPT: ${err.message}`);
     }
   }
 
-  // 2️⃣ Claude fallback
-  if (process.env.CLAUDE_API_KEY) {
+  // 2️⃣ Gemini fallback
+  if (process.env.GEMINI_API_KEY) {
     try {
-      await editMessage(chatId, statusId, '🤖 ChatGPT busy — switching to Claude...');
-      const result = await analyzeChartClaude(imagePath, payload);
-      result.provider = 'Claude';
+      await editMessage(chatId, statusId, '⚡ Switching to Gemini...');
+      const result = await analyzeChartGemini(imagePath, payload);
+      result.provider = 'Gemini';
       return result;
     } catch (err) {
-      console.error('[bot] Claude failed:', err.message);
-      // fall through
+      console.error('[bot] Gemini failed:', err.statusCode, err.message);
+      errors.push(`Gemini: ${err.message}`);
     }
   }
 
   // 3️⃣ OpenRouter last resort
   if (process.env.OPENROUTER_API_KEY) {
-    await editMessage(chatId, statusId, '⚡ Switching to fallback AI provider...');
-    const result = await analyzeChartWithOpenRouter(imagePath, payload);
-    result.provider = result.provider || 'OpenRouter';
-    return result;
+    try {
+      await editMessage(chatId, statusId, '⚡ Switching to OpenRouter...');
+      const result = await analyzeChartWithOpenRouter(imagePath, payload);
+      result.provider = result.provider || 'OpenRouter';
+      return result;
+    } catch (err) {
+      console.error('[bot] OpenRouter failed:', err.statusCode, err.message);
+      errors.push(`OpenRouter: ${err.message}`);
+    }
   }
 
-  throw Object.assign(new Error('No AI providers configured.'), {
+  console.error('[bot] All providers failed:', errors.join(' | '));
+  throw Object.assign(new Error('All AI providers failed.'), {
     statusCode: 503,
-    publicMessage: 'No AI providers are configured. Please set OPENAI_API_KEY, CLAUDE_API_KEY, or OPENROUTER_API_KEY.',
+    publicMessage: `All AI providers are currently unavailable. Please retry in a moment.`,
   });
 }
 
@@ -277,7 +285,7 @@ function addSpikeAlert(chatId, coinInput, threshold = DEFAULT_SPIKE_PERCENT) {
     lastPrice: null,
     lastNotifiedAt: 0,
   };
-  const alerts  = alertsByChat.get(chatId) || [];
+  const alerts   = alertsByChat.get(chatId) || [];
   const filtered = alerts.filter(a => a.coinId !== coinId);
   filtered.push(item);
   alertsByChat.set(chatId, filtered);
@@ -424,8 +432,8 @@ async function handleCallback(query) {
   if (!chatId) return;
   await answerCallback(query.id);
 
-  if (data === 'btc') { await handleBtc(chatId); return; }
-  if (data === 'help') { await handleHelp(chatId); return; }
+  if (data === 'btc')    { await handleBtc(chatId); return; }
+  if (data === 'help')   { await handleHelp(chatId); return; }
   if (data === 'alerts') {
     await sendMessage(chatId, formatAlerts(chatId), { reply_markup: mainKeyboard() });
     return;
@@ -495,7 +503,7 @@ async function handlePhoto(chatId, photo) {
 
     const payload = { mimeType: processed.mimeType, ocrText, marketContext, originalImage: processed.metadata };
 
-    // GPT → Claude → OpenRouter
+    // GPT → Gemini → OpenRouter
     let analysis = await analyzeWithFallbacks(processed.analysisPath, payload, statusId, chatId);
     analysis = addCodexAnalyst(analysis, { ocrText, marketContext });
 
@@ -580,8 +588,8 @@ async function checkSpikeAlerts() {
         if (!Number.isFinite(snapshot.price)) continue;
 
         if (alert.lastPrice) {
-          const move    = ((snapshot.price - alert.lastPrice) / alert.lastPrice) * 100;
-          const absMove = Math.abs(move);
+          const move       = ((snapshot.price - alert.lastPrice) / alert.lastPrice) * 100;
+          const absMove    = Math.abs(move);
           const cooledDown = Date.now() - alert.lastNotifiedAt > ALERT_CHECK_MS * 2;
           if (absMove >= alert.threshold && cooledDown) {
             alert.lastNotifiedAt = Date.now();
