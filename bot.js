@@ -9,7 +9,6 @@
  * Send any photo → full chart analysis
  */
 
-import 'dotenv/config';
 import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
@@ -25,8 +24,7 @@ const API     = `https://api.telegram.org/bot${TOKEN}`;
 const FILE_API = `https://api.telegram.org/file/bot${TOKEN}`;
 
 if (!TOKEN) {
-  console.error('TELEGRAM_BOT_TOKEN is not set in .env');
-  process.exit(1);
+  console.warn('[bot] TELEGRAM_BOT_TOKEN not set — Telegram bot will not start.');
 }
 
 // ─── Telegram API helpers ────────────────────────────────────────────────────
@@ -340,13 +338,18 @@ async function poll() {
   setImmediate(poll);
 }
 
-// ─── Start ───────────────────────────────────────────────────────────────────
+// ─── Export ──────────────────────────────────────────────────────────────────
 
-console.log('[bot] ChartMind AI Telegram bot starting...');
-tgPost('getMe').then(info => {
-  console.log(`[bot] Connected as @${info.result?.username}`);
-  poll();
-}).catch(err => {
-  console.error('[bot] Failed to connect to Telegram:', err.message);
-  process.exit(1);
-});
+export function startBot() {
+  if (!TOKEN) {
+    console.warn('[bot] Skipping Telegram bot — no token.');
+    return;
+  }
+  console.log('[bot] ChartMind AI Telegram bot starting...');
+  tgPost('getMe').then(info => {
+    console.log(`[bot] Connected as @${info.result?.username}`);
+    poll();
+  }).catch(err => {
+    console.error('[bot] Failed to connect to Telegram:', err.message);
+  });
+}

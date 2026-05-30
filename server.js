@@ -6,6 +6,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 import analyzeRoute from './routes/analyze.js';
+import { startBot } from './bot.js';
 
 dotenv.config();
 
@@ -53,9 +54,9 @@ app.use((error, _req, res, next) => {
 const PORT = process.env.PORT || 3000;
 
 const server = app.listen(PORT, () => {
-  console.log(
-    `ChartMind AI running on port ${PORT}`
-  );
+  console.log(`ChartMind AI running on port ${PORT}`);
+  // Start Telegram bot in the same process
+  startBot();
 });
 
 server.on('error', (error) => {
