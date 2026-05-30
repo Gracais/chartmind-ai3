@@ -3,18 +3,18 @@ import multer from 'multer';
 import fs from 'fs/promises';
 import path from 'path';
 
-import { analyzeChart }                    from '../services/huggingface.js';
-import { getBitcoinMarketContext, btcCache } from '../services/marketData.js';
-import { extractChartText }                from '../services/ocr.js';
-import { preprocessChartImage }            from '../services/preprocess.js';
-import { addCodexAnalyst }                 from '../services/codexAnalyst.js';
+import { analyzeChart as analyzeWithChatGPT }   from '../services/chatgpt.js';
+import { analyzeChart as analyzeWithClaude }    from '../services/claude.js';
+import { getBitcoinMarketContext, btcCache }   from '../services/marketData.js';
+import { extractChartText }                    from '../services/ocr.js';
+import { preprocessChartImage }                from '../services/preprocess.js';
+import { addCodexAnalyst }                     from '../services/codexAnalyst.js';
 
 const router = express.Router();
 const MAX_FILE_SIZE_MB = Number(process.env.MAX_UPLOAD_MB || 8);
 const allowedMimeTypes = new Set(['image/png', 'image/jpeg', 'image/webp']);
 
 // How long to wait for BTC market data before proceeding without it.
-// Kept high for Render cold-start — but cached responses are instant.
 const BTC_FETCH_BUDGET_MS = Number(process.env.BTC_FETCH_BUDGET_MS || 15_000);
 
 const upload = multer({
@@ -59,16 +59,53 @@ function withBudget(promise, ms) {
   });
 }
 
-// ── AI provider: Hugging Face LLaVA (Free) ────────────────────────────────
+// ── Multi-AI Analysis: ChatGPT (primary) + Claude (secondary) + Codex (audit) ────────────────
 async function runAIAnalysis(imagePath, extraData) {
-  try {
-    const result = await analyzeChart(imagePath, extraData);
-    console.log('[analyze] AI provider: Hugging Face ✓');
-    return result;
-  } catch (error) {
-    console.error('[analyze] Hugging Face failed:', error.publicMessage || error.message);
-    throw error;
+  let chatgptResult = null;
+  let claudeResult = null;
+  let chatgptError = null;
+  let claudeError = null;
+
+  // Run both analyses in parallel
+  const [gptRes, claudeRes] = await Promise.all([
+    (async () => {
+      try {
+        chatgptResult = await analyzeWithChatGPT(imagePath, extraData);
+        console.log('[analyze] ChatGPT analysis ✓');
+        return { success: true };
+      } catch (error) {
+        chatgptError = error;
+        console.error('[analyze] ChatGPT failed:', error.publicMessage || error.message);
+        return { success: false };
+      }
+    })(),
+    (async () => {
+      try {
+        claudeResult = await analyzeWithClaude(imagePath, extraData);
+        console.log('[analyze] Claude analysis ✓');
+        return { success: true };
+      } catch (error) {
+        claudeError = error;
+        console.error('[analyze] Claude failed:', error.publicMessage || error.message);
+        return { success: false };
+      }
+    })(),
+  ]);
+
+  // If ChatGPT succeeded, use it as primary with Claude as secondary opinion
+  if (chatgptResult) {
+    chatgptResult.secondOpinion = claudeResult || null;
+    return chatgptResult;
   }
+
+  // If ChatGPT failed but Claude succeeded, use Claude
+  if (claudeResult) {
+    claudeResult.provider = 'Claude (ChatGPT unavailable)';
+    return claudeResult;
+  }
+
+  // Both failed
+  throw chatgptError || claudeError || new Error('Both AI providers failed');
 }
 
 function createFallbackAnalysis({ ocrText, marketContext, reason }) {
@@ -83,10 +120,10 @@ function createFallbackAnalysis({ ocrText, marketContext, reason }) {
     },
     confidence: 15,
     warnings: [
-      reason || 'AI provider is temporarily unavailable.',
+      reason || 'AI providers are temporarily unavailable.',
       'No trade should be taken from fallback mode alone.',
     ],
-    summary: 'ChartMind processed the upload and market context, but the AI provider could not complete visual chart reasoning. Please retry shortly.',
+    summary: 'ChartMind processed the upload and market context, but the AI providers could not complete visual chart reasoning. Please retry shortly.',
     keyObservations: [
       ocrText ? 'OCR extracted chart text for the next full analysis attempt.' : 'OCR did not extract enough chart text.',
       `BTC market regime context is ${marketContext?.trend || 'unknown'}.`,
@@ -106,7 +143,6 @@ router.post('/', async (req, res) => {
   let marketContext = null;
 
   // ── Kick off BTC fetch immediately on request arrival.
-  // If a recent cached result exists it resolves in <1ms.
   const btcFetchPromise = withBudget(
     getBitcoinMarketContext(),
     btcCache.fresh() ? 500 : BTC_FETCH_BUDGET_MS,
