@@ -3,19 +3,18 @@ import multer from 'multer';
 import fs from 'fs/promises';
 import path from 'path';
 
-import { analyzeChart as analyzeWithChatGPT }   from '../services/chatgpt.js';
-import { analyzeChart as analyzeWithClaude }    from '../services/claude.js';
+import { analyzeChart as analyzeWithChatGPT } from '../services/chatgpt.js';
+import { analyzeChart as analyzeWithGemini }  from '../services/gemini.js';
+import { analyzeChartWithOpenRouter }          from '../services/openrouter.js';
 import { getBitcoinMarketContext, btcCache }   from '../services/marketData.js';
-import { extractChartText }                    from '../services/ocr.js';
-import { preprocessChartImage }                from '../services/preprocess.js';
-import { addCodexAnalyst }                     from '../services/codexAnalyst.js';
+import { extractChartText }                   from '../services/ocr.js';
+import { preprocessChartImage }               from '../services/preprocess.js';
+import { addCodexAnalyst }                    from '../services/codexAnalyst.js';
 
 const router = express.Router();
-const MAX_FILE_SIZE_MB = Number(process.env.MAX_UPLOAD_MB || 8);
-const allowedMimeTypes = new Set(['image/png', 'image/jpeg', 'image/webp']);
-
-// How long to wait for BTC market data before proceeding without it.
+const MAX_FILE_SIZE_MB  = Number(process.env.MAX_UPLOAD_MB    || 8);
 const BTC_FETCH_BUDGET_MS = Number(process.env.BTC_FETCH_BUDGET_MS || 15_000);
+const allowedMimeTypes  = new Set(['image/png', 'image/jpeg', 'image/webp']);
 
 const upload = multer({
   dest: 'uploads/',
@@ -46,7 +45,6 @@ function multerMiddleware(req, res) {
   });
 }
 
-// Resolves with { value } or { timedOut: true } — never rejects.
 function withBudget(promise, ms) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
@@ -54,82 +52,82 @@ function withBudget(promise, ms) {
       resolve({ timedOut: true });
     }, ms);
     promise
-      .then((value) => { clearTimeout(timer); resolve({ value }); })
-      .catch((err)  => { clearTimeout(timer); console.error('[analyze] BTC fetch error:', err.message); resolve({ timedOut: true }); });
+      .then(value => { clearTimeout(timer); resolve({ value }); })
+      .catch(err  => { clearTimeout(timer); console.error('[analyze] BTC fetch error:', err.message); resolve({ timedOut: true }); });
   });
 }
 
-// ── Multi-AI Analysis: ChatGPT (primary) + Claude (secondary) + Codex (audit) ────────────────
+// ── AI provider chain: GPT → Gemini → OpenRouter ──────────────────────────────
 async function runAIAnalysis(imagePath, extraData) {
-  let chatgptResult = null;
-  let claudeResult = null;
-  let chatgptError = null;
-  let claudeError = null;
-
-  // Run both analyses in parallel
-  const [gptRes, claudeRes] = await Promise.all([
-    (async () => {
-      try {
-        chatgptResult = await analyzeWithChatGPT(imagePath, extraData);
-        console.log('[analyze] ChatGPT analysis ✓');
-        return { success: true };
-      } catch (error) {
-        chatgptError = error;
-        console.error('[analyze] ChatGPT failed:', error.publicMessage || error.message);
-        return { success: false };
-      }
-    })(),
-    (async () => {
-      try {
-        claudeResult = await analyzeWithClaude(imagePath, extraData);
-        console.log('[analyze] Claude analysis ✓');
-        return { success: true };
-      } catch (error) {
-        claudeError = error;
-        console.error('[analyze] Claude failed:', error.publicMessage || error.message);
-        return { success: false };
-      }
-    })(),
-  ]);
-
-  // If ChatGPT succeeded, use it as primary with Claude as secondary opinion
-  if (chatgptResult) {
-    chatgptResult.secondOpinion = claudeResult || null;
-    return chatgptResult;
+  // 1️⃣ GPT primary
+  if (process.env.OPENAI_API_KEY) {
+    try {
+      const result = await analyzeWithChatGPT(imagePath, extraData);
+      result.provider = 'ChatGPT (GPT-4o)';
+      console.log('[analyze] ChatGPT analysis ✓');
+      return result;
+    } catch (err) {
+      console.error('[analyze] ChatGPT failed:', err.publicMessage || err.message);
+    }
   }
 
-  // If ChatGPT failed but Claude succeeded, use Claude
-  if (claudeResult) {
-    claudeResult.provider = 'Claude (ChatGPT unavailable)';
-    return claudeResult;
+  // 2️⃣ Gemini fallback
+  if (process.env.GEMINI_API_KEY) {
+    try {
+      const result = await analyzeWithGemini(imagePath, extraData);
+      result.provider = 'Gemini';
+      console.log('[analyze] Gemini analysis ✓');
+      return result;
+    } catch (err) {
+      console.error('[analyze] Gemini failed:', err.publicMessage || err.message);
+    }
   }
 
-  // Both failed
-  throw chatgptError || claudeError || new Error('Both AI providers failed');
+  // 3️⃣ OpenRouter last resort
+  if (process.env.OPENROUTER_API_KEY) {
+    try {
+      const result = await analyzeChartWithOpenRouter(imagePath, extraData);
+      result.provider = result.provider || 'OpenRouter';
+      console.log('[analyze] OpenRouter analysis ✓');
+      return result;
+    } catch (err) {
+      console.error('[analyze] OpenRouter failed:', err.publicMessage || err.message);
+    }
+  }
+
+  throw Object.assign(new Error('All AI providers failed.'), {
+    statusCode: 503,
+    publicMessage: 'All AI providers are currently unavailable. Please retry in a moment.',
+  });
 }
 
 function createFallbackAnalysis({ ocrText, marketContext, reason }) {
   return addCodexAnalyst({
     trend: 'neutral',
     marketStructure: 'AI vision analysis temporarily unavailable.',
-    support: [], resistance: [],
-    rsi: null, macd: 'Not confirmed',
+    marketStructureDetail: { pattern: 'Not available', bos: 'Not visible', choch: 'Not visible', orderBlocks: [], fairValueGaps: [], liquidityZones: [] },
+    support: [], resistance: [], psychologicalLevels: [],
+    rsi: null, macd: 'Not confirmed', stochRsi: 'Not visible',
+    candlePattern: 'Not visible',
+    movingAverages: { ma20: 'Not visible', ma50: 'Not visible', ma100: 'Not visible', ma200: 'Not visible', alignment: 'Not visible', crossovers: 'Not visible' },
     tradeSetup: {
-      direction: 'NO TRADE', entry: null, stopLoss: null, takeProfit: null, riskReward: null,
-      invalidation: 'Wait for full AI chart analysis before taking a setup.',
+      direction: 'NO TRADE', entry: null, stopLoss: null,
+      takeProfit1: null, takeProfit2: null, takeProfit3: null,
+      riskReward: null, invalidation: 'Wait for full AI analysis before taking any setup.',
+      timeframeBias: 'Not visible',
     },
+    probability: { bullish: null, bearish: null, sideways: null, confidence: 15 },
     confidence: 15,
-    warnings: [
-      reason || 'AI providers are temporarily unavailable.',
-      'No trade should be taken from fallback mode alone.',
-    ],
-    summary: 'ChartMind processed the upload and market context, but the AI providers could not complete visual chart reasoning. Please retry shortly.',
+    volumeAnalysis: 'Not confirmed', volumeDivergence: 'Not visible',
+    openInterest: 'Not visible', fundingRate: 'Not visible',
+    scenarioAnalysis: { bullCase: 'Not available', bearCase: 'Not available', baseCase: 'Not available' },
+    warnings: [reason || 'AI providers are temporarily unavailable.', 'No trade should be taken from fallback mode.'],
+    summary: 'ChartMind processed the upload but AI providers could not complete visual chart reasoning. Please retry shortly.',
     keyObservations: [
-      ocrText ? 'OCR extracted chart text for the next full analysis attempt.' : 'OCR did not extract enough chart text.',
-      `BTC market regime context is ${marketContext?.trend || 'unknown'}.`,
+      ocrText ? 'OCR extracted chart text.' : 'OCR did not extract enough chart text.',
+      `BTC market regime: ${marketContext?.trend || 'unknown'}.`,
     ],
     indicators: {},
-    volumeAnalysis: 'Not confirmed without full AI analysis.',
     metadata: { pair: 'Not confirmed', timeframe: 'Not confirmed', exchange: 'Not confirmed', currentPrice: 'Not confirmed' },
     btcContext: marketContext?.note || 'BTC context available but AI chart reasoning unavailable.',
     provider: 'Fallback (no AI)',
@@ -142,7 +140,6 @@ router.post('/', async (req, res) => {
   let ocrText = '';
   let marketContext = null;
 
-  // ── Kick off BTC fetch immediately on request arrival.
   const btcFetchPromise = withBudget(
     getBitcoinMarketContext(),
     btcCache.fresh() ? 500 : BTC_FETCH_BUDGET_MS,
@@ -160,7 +157,6 @@ router.post('/', async (req, res) => {
 
     filesToClean.push(req.file.path);
 
-    // Preprocess + OCR + BTC all race in parallel
     const [processed, btcResult] = await Promise.all([
       preprocessChartImage(req.file.path),
       btcFetchPromise,
@@ -168,8 +164,7 @@ router.post('/', async (req, res) => {
 
     filesToClean.push(processed.analysisPath, processed.ocrPath);
 
-    // OCR runs on already-preprocessed file; BTC may already be done
-    ocrText = await extractChartText(processed.ocrPath);
+    ocrText       = await extractChartText(processed.ocrPath);
     marketContext = btcResult.timedOut ? null : btcResult.value;
 
     if (marketContext) {
@@ -178,12 +173,15 @@ router.post('/', async (req, res) => {
       console.warn('[analyze] Proceeding without BTC context');
     }
 
-    const analysis = addCodexAnalyst(await runAIAnalysis(processed.analysisPath, {
-      mimeType: processed.mimeType,
-      ocrText,
-      marketContext,
-      originalImage: processed.metadata,
-    }), { ocrText, marketContext });
+    const analysis = addCodexAnalyst(
+      await runAIAnalysis(processed.analysisPath, {
+        mimeType: processed.mimeType,
+        ocrText,
+        marketContext,
+        originalImage: processed.metadata,
+      }),
+      { ocrText, marketContext }
+    );
 
     return res.json({
       success: true,
@@ -197,6 +195,7 @@ router.post('/', async (req, res) => {
         },
       },
     });
+
   } catch (error) {
     const status = error.statusCode || 500;
     if (status >= 500) console.error('[analyze]', error);
