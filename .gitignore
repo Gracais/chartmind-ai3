@@ -3,3 +3,4 @@ uploads/*
 !uploads/.gitkeep
 .env
 *.traineddata
+.env.bak

@@ -1,0 +1,882 @@
+[33mcommit ba9a077655b86264484170c16b73827176db2880[m
+Author: grcx <collinsville21355@gmail.com>
+Date:   Sat May 30 08:05:14 2026 +0100
+
+    reloaded
+
+[1mdiff --git a/.env.bak b/.env.bak[m
+[1mnew file mode 100644[m
+[1mindex 0000000..b35445e[m
+[1m--- /dev/null[m
+[1m+++ b/.env.bak[m
+[36m@@ -0,0 +1,21 @@[m
+[32m+[m[32mGEMINI_API_KEY=AQ.Ab8RN6LayY7xS7_A7dD67IvOQJ4CzRGELSKXkLlreoCtGwM1Ag[m
+[32m+[m[32mTELEGRAM_BOT_TOKEN=8713988797:AAG92DFt9UAauRDt8inrAIqaF6M87AxIPhs[m
+[32m+[m
+[32m+[m[32m# ── NEW: OpenRouter fallback (free tier) ─────────────────────────────────────[m
+[32m+[m[32m# Get your key at: https://openrouter.ai/keys  (free, no credit card needed)[m
+[32m+[m[32mOPENROUTER_API_KEY=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[m
+[32m+[m
+[32m+[m[32m# Optional tuning[m
+[32m+[m[32m# OPENROUTER_MODELS=google/gemini-2.0-flash-exp:free,meta-llama/llama-4-maverick:free,mistralai/mistral-small-3.2-24b-instruct:free[m
+[32m+[m[32m# OPENROUTER_TIMEOUT_MS=40000[m
+[32m+[m
+[32m+[m[32m# BTC cache TTL in ms (default 90s — keeps market data fresh without hammering APIs)[m
+[32m+[m[32m# BTC_CACHE_TTL_MS=90000[m
+[32m+[m
+[32m+[m[32m# Existing optional vars[m
+[32m+[m[32m# GEMINI_MODELS=gemini-2.5-flash,gemini-2.0-flash,gemini-2.0-flash-lite[m
+[32m+[m[32m# GEMINI_TIMEOUT_MS=35000[m
+[32m+[m[32m# BTC_FETCH_BUDGET_MS=15000[m
+[32m+[m[32m# MARKET_TIMEOUT_MS=50000[m
+[32m+[m[32m# MAX_UPLOAD_MB=8[m
+[32m+[m[32m# PORT=3000[m
+[1mdiff --git a/bot.js b/bot.js[m
+[1mindex 303606f..b9f2acf 100644[m
+[1m--- a/bot.js[m
+[1m+++ b/bot.js[m
+[36m@@ -440,8 +440,10 @@[m [masync function handlePhoto(chatId, photo) {[m
+         mimeType: processed.mimeType, ocrText, marketContext, originalImage: processed.metadata,[m
+       });[m
+     } catch (geminiErr) {[m
+[31m-      const isTransient = geminiErr.retryable !== false || geminiErr.statusCode >= 500;[m
+[31m-      if (!isTransient) throw geminiErr;[m
+[32m+[m[32m      const canUseOpenRouter = Boolean(process.env.OPENROUTER_API_KEY);[m
+[32m+[m[32m      const isGeminiAuthOrConfig = geminiErr.statusCode === 400 || geminiErr.statusCode === 401 || geminiErr.statusCode === 403;[m
+[32m+[m[32m      const shouldFallback = canUseOpenRouter && (geminiErr.retryable !== false || geminiErr.statusCode >= 500 || isGeminiAuthOrConfig);[m
+[32m+[m[32m      if (!shouldFallback) throw geminiErr;[m
+       console.error('[bot] Gemini failed, trying OpenRouter fallback:', geminiErr.message);[m
+       await editMessage(chatId, statusId, '⚡ Gemini busy — switching to fallback AI...');[m
+       analysis = await analyzeChartWithOpenRouter(processed.analysisPath, {[m
+[36m@@ -458,7 +460,7 @@[m [masync function handlePhoto(chatId, photo) {[m
+     console.error('[bot] photo handler error:', err);[m
+     const errText = err.statusCode === 503[m
+       ? '⚠️ *Both AI providers are temporarily busy.* Please retry in a moment.'[m
+[31m-      : '❌ *Analysis failed.* Make sure the image is a clear chart screenshot and try again.';[m
+[32m+[m[32m      : `❌ *Analysis failed.* ${err.publicMessage || err.message || 'Make sure the image is a clear chart screenshot and try again.'}`;[m
+     if (statusId) {[m
+       await editMessage(chatId, statusId, errText).catch(() => sendMessage(chatId, errText));[m
+     } else {[m
+[1mdiff --git a/bot.js.bak b/bot.js.bak[m
+[1mnew file mode 100644[m
+[1mindex 0000000..303606f[m
+[1m--- /dev/null[m
+[1m+++ b/bot.js.bak[m
+[36m@@ -0,0 +1,577 @@[m
+[32m+[m[32mimport 'dotenv/config';[m
+[32m+[m[32mimport fs from 'fs/promises';[m
+[32m+[m[32mimport path from 'path';[m
+[32m+[m[32mimport os from 'os';[m
+[32m+[m[32mimport fetch from 'node-fetch';[m
+[32m+[m
+[32m+[m[32mimport { analyzeChart }               from './services/gemini.js';[m
+[32m+[m[32mimport { analyzeChartWithOpenRouter } from './services/openrouter.js';[m
+[32m+[m[32mimport { getBitcoinMarketContext }    from './services/marketData.js';[m
+[32m+[m[32mimport { extractChartText }           from './services/ocr.js';[m
+[32m+[m[32mimport { preprocessChartImage }       from './services/preprocess.js';[m
+[32m+[m[32mimport { addCodexAnalyst }            from './services/codexAnalyst.js';[m
+[32m+[m[32mimport { getCoinPriceSnapshot, resolveCoinId, supportedCoinList } from './services/coinPrices.js';[m
+[32m+[m
+[32m+[m[32mconst TOKEN    = process.env.TELEGRAM_BOT_TOKEN;[m
+[32m+[m[32mconst API      = `https://api.telegram.org/bot${TOKEN}`;[m
+[32m+[m[32mconst FILE_API = `https://api.telegram.org/file/bot${TOKEN}`;[m
+[32m+[m[32mconst ALERT_CHECK_MS = Number(process.env.ALERT_CHECK_MS || 60_000);[m
+[32m+[m[32mconst DEFAULT_SPIKE_PERCENT = Number(process.env.DEFAULT_SPIKE_PERCENT || 3);[m
+[32m+[m
+[32m+[m[32mconst alertsByChat = new Map();[m
+[32m+[m[32mconst pendingByChat = new Map();[m
+[32m+[m[32mlet alertTimer = null;[m
+[32m+[m
+[32m+[m[32m// ─── Telegram API helpers ────────────────────────────────────────────────────[m
+[32m+[m
+[32m+[m[32masync function tgPost(method, body) {[m
+[32m+[m[32m  const res = await fetch(`${API}/${method}`, {[m
+[32m+[m[32m    method: 'POST',[m
+[32m+[m[32m    headers: { 'Content-Type': 'application/json' },[m
+[32m+[m[32m    body: JSON.stringify(body),[m
+[32m+[m[32m  });[m
+[32m+[m[32m  return res.json();[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction mainKeyboard() {[m
+[32m+[m[32m  return {[m
+[32m+[m[32m    inline_keyboard: [[m
+[32m+[m[32m      [[m
+[32m+[m[32m        { text: 'BTC Regime', callback_data: 'btc' },[m
+[32m+[m[32m        { text: 'Price BTC', callback_data: 'price:btc' },[m
+[32m+[m[32m        { text: 'Price ETH', callback_data: 'price:eth' },[m
+[32m+[m[32m      ],[m
+[32m+[m[32m      [[m
+[32m+[m[32m        { text: 'Set Spike Alert', callback_data: 'alert_menu' },[m
+[32m+[m[32m        { text: 'My Alerts', callback_data: 'alerts' },[m
+[32m+[m[32m        { text: 'Help', callback_data: 'help' },[m
+[32m+[m[32m      ],[m
+[32m+[m[32m    ],[m
+[32m+[m[32m  };[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32masync function answerCallback(callbackQueryId, text = '') {[m
+[32m+[m[32m  if (!callbackQueryId) return;[m
+[32m+[m[32m  await tgPost('answerCallbackQuery', {[m
+[32m+[m[32m    callback_query_id: callbackQueryId,[m
+[32m+[m[32m    text,[m
+[32m+[m[32m    show_alert: false,[m
+[32m+[m[32m  });[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32masync function sendMessage(chatId, text, extra = {}) {[m
+[32m+[m[32m  return tgPost('sendMessage', {[m
+[32m+[m[32m    chat_id: chatId,[m
+[32m+[m[32m    text,[m
+[32m+[m[32m    parse_mode: 'Markdown',[m
+[32m+[m[32m    ...extra,[m
+[32m+[m[32m  });[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32masync function editMessage(chatId, messageId, text) {[m
+[32m+[m[32m  return tgPost('editMessageText', {[m
+[32m+[m[32m    chat_id: chatId,[m
+[32m+[m[32m    message_id: messageId,[m
+[32m+[m[32m    text,[m
+[32m+[m[32m    parse_mode: 'Markdown',[m
+[32m+[m[32m  });[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32masync function downloadFile(fileId) {[m
+[32m+[m[32m  const info = await fetch(`${API}/getFile?file_id=${fileId}`).then(r => r.json());[m
+[32m+[m[32m  if (!info.ok) throw new Error('Could not get file info from Telegram');[m
+[32m+[m[32m  const filePath = info.result.file_path;[m
+[32m+[m[32m  const ext      = path.extname(filePath) || '.jpg';[m
+[32m+[m[32m  const tmpPath  = path.join(os.tmpdir(), `cm_${Date.now()}${ext}`);[m
+[32m+[m[32m  const fileRes  = await fetch(`${FILE_API}/${filePath}`);[m
+[32m+[m[32m  const buffer   = await fileRes.arrayBuffer();[m
+[32m+[m[32m  await fs.writeFile(tmpPath, Buffer.from(buffer));[m
+[32m+[m[32m  return tmpPath;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// ─── Formatters ──────────────────────────────────────────────────────────────[m
+[32m+[m
+[32m+[m[32mfunction trendEmoji(trend) {[m
+[32m+[m[32m  if (!trend) return '⚪';[m
+[32m+[m[32m  const t = trend.toLowerCase();[m
+[32m+[m[32m  if (t.includes('bull') || t.includes('up'))   return '🟢';[m
+[32m+[m[32m  if (t.includes('bear') || t.includes('down')) return '🔴';[m
+[32m+[m[32m  return '🟡';[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction directionEmoji(direction) {[m
+[32m+[m[32m  if (!direction) return '⚪';[m
+[32m+[m[32m  const d = direction.toUpperCase();[m
+[32m+[m[32m  if (d.includes('BUY')  || d.includes('LONG'))  return '📈';[m
+[32m+[m[32m  if (d.includes('SELL') || d.includes('SHORT')) return '📉';[m
+[32m+[m[32m  return '⏸';[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction formatAnalysis(analysis, marketContext) {[m
+[32m+[m[32m  const m   = analysis.metadata || {};[m
+[32m+[m[32m  const s   = analysis.tradeSetup || {};[m
+[32m+[m[32m  const btc = marketContext?.intraday;[m
+[32m+[m[32m  const te  = trendEmoji(analysis.trend);[m
+[32m+[m[32m  const de  = directionEmoji(s.direction);[m
+[32m+[m[32m  const lines = [];[m
+[32m+[m
+[32m+[m[32m  lines.push(`*📊 ChartMind AI — Trading Desk Brief*`);[m
+[32m+[m[32m  lines.push(`━━━━━━━━━━━━━━━━━━━━`);[m
+[32m+[m[32m  lines.push(`*Pair:* ${m.pair || 'Unknown'}`);[m
+[32m+[m[32m  lines.push(`*Timeframe:* ${m.timeframe || 'Unknown'}`);[m
+[32m+[m[32m  lines.push(`*Price:* ${m.currentPrice || 'Unknown'}`);[m
+[32m+[m[32m  lines.push(`*Exchange:* ${m.exchange || 'Unknown'}`);[m
+[32m+[m[32m  lines.push('');[m
+[32m+[m[32m  lines.push(`*Market Trend:* ${te} ${(analysis.trend || 'neutral').toUpperCase()}`);[m
+[32m+[m[32m  lines.push(`*Confidence:* ${analysis.confidence}/100`);[m
+[32m+[m[32m  if (analysis.marketStructure) lines.push(`${analysis.marketStructure}`);[m
+[32m+[m[32m  lines.push('');[m
+[32m+[m[32m  lines.push(`*${de} Setup: ${s.direction || 'NO TRADE'}*`);[m
+[32m+[m[32m  if (s.entry)        lines.push(`  Entry:        \`${s.entry}\``);[m
+[32m+[m[32m  if (s.stopLoss)     lines.push(`  Stop Loss:    \`${s.stopLoss}\``);[m
+[32m+[m[32m  if (s.takeProfit)   lines.push(`  Take Profit:  \`${s.takeProfit}\``);[m
+[32m+[m[32m  if (s.riskReward)   lines.push(`  R:R Ratio:    ${s.riskReward}`);[m
+[32m+[m[32m  if (s.invalidation) lines.push(`  Invalidation: ${s.invalidation}`);[m
+[32m+[m[32m  lines.push('');[m
+[32m+[m[32m  if (analysis.support?.length)    lines.push(`*Support:* ${analysis.support.join(' | ')}`);[m
+[32m+[m[32m  if (analysis.resistance?.length) lines.push(`*Resistance:* ${analysis.resistance.join(' | ')}`);[m
+[32m+[m[32m  if (analysis.support?.length || analysis.resistance?.length) lines.push('');[m
+[32m+[m[32m  if (analysis.rsi)  lines.push(`*RSI:* ${analysis.rsi}`);[m
+[32m+[m[32m  if (analysis.macd && analysis.macd !== 'Not visible') lines.push(`*MACD:* ${analysis.macd}`);[m
+[32m+[m[32m  if (analysis.volumeAnalysis && analysis.volumeAnalysis !== 'Not visible') {[m
+[32m+[m[32m    lines.push(`*Volume:* ${analysis.volumeAnalysis}`);[m
+[32m+[m[32m  }[m
+[32m+[m[32m  lines.push('');[m
+[32m+[m[32m  if (btc && marketContext?.trend !== 'unknown') {[m
+[32m+[m[32m    lines.push(`*BTC Regime:* ${trendEmoji(marketContext.trend)} ${marketContext.trend?.toUpperCase()}`);[m
+[32m+[m[32m    lines.push(`  Price: $${btc.price?.toLocaleString() || 'N/A'}  |  RSI: ${btc.rsi || 'N/A'}`);[m
+[32m+[m[32m    lines.push('');[m
+[32m+[m[32m  }[m
+[32m+[m[32m  lines.push(`*Summary*`);[m
+[32m+[m[32m  lines.push(analysis.summary || 'No summary.');[m
+[32m+[m[32m  lines.push('');[m
+[32m+[m[32m  if (analysis.warnings?.length) {[m
+[32m+[m[32m    lines.push(`⚠️ ${analysis.warnings.join('\n⚠️ ')}`);[m
+[32m+[m[32m    lines.push('');[m
+[32m+[m[32m  }[m
+[32m+[m[32m  if (analysis.codexAnalyst) {[m
+[32m+[m[32m    lines.push(`*Codex Second Opinion:* ${analysis.codexAnalyst.verdict}`);[m
+[32m+[m[32m    lines.push(`  Score: ${analysis.codexAnalyst.score}/100  |  BTC: ${analysis.codexAnalyst.alignment}`);[m
+[32m+[m[32m    if (analysis.codexAnalyst.note) lines.push(`  ${analysis.codexAnalyst.note}`);[m
+[32m+[m[32m    lines.push('');[m
+[32m+[m[32m  }[m
+[32m+[m[32m  if (analysis.provider && analysis.provider !== 'Gemini') {[m
+[32m+[m[32m    lines.push(`_⚡ Analyzed by ${analysis.provider}_`);[m
+[32m+[m[32m  }[m
+[32m+[m[32m  if (analysis.degraded) {[m
+[32m+[m[32m    lines.push(`_⚠️ Fallback mode — retry for full analysis._`);[m
+[32m+[m[32m  }[m
+[32m+[m[32m  return lines.join('\n');[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction formatBtcSnapshot(ctx) {[m
+[32m+[m[32m  if (!ctx || ctx.trend === 'unknown') {[m
+[32m+[m[32m    return '❌ *BTC market data unavailable right now.* Try again in a moment.';[m
+[32m+[m[32m  }[m
+[32m+[m[32m  const i  = ctx.intraday;[m
+[32m+[m[32m  const h  = ctx.higherTimeframe;[m
+[32m+[m[32m  const te = trendEmoji(ctx.trend);[m
+[32m+[m[32m  return [[m
+[32m+[m[32m    `*🟠 BTC Regime Snapshot*`,[m
+[32m+[m[32m    `━━━━━━━━━━━━━━━━━━━━`,[m
+[32m+[m[32m    `*Trend:* ${te} ${ctx.trend?.toUpperCase()}`,[m
+[32m+[m[32m    `*Source:* ${ctx.source}`,[m
+[32m+[m[32m    '',[m
+[32m+[m[32m    `*4H Data*`,[m
+[32m+[m[32m    `  Price:  $${i?.price?.toLocaleString() || 'N/A'}`,[m
+[32m+[m[32m    `  RSI:    ${i?.rsi || 'N/A'}`,[m
+[32m+[m[32m    `  EMA20:  ${i?.ema20 || 'N/A'}`,[m
+[32m+[m[32m    `  EMA50:  ${i?.ema50 || 'N/A'}`,[m
+[32m+[m[32m    `  Volume: ${i?.volumeState || 'N/A'}`,[m
+[32m+[m[32m    '',[m
+[32m+[m[32m    `*Daily Data*`,[m
+[32m+[m[32m    `  24h Change: ${h?.change != null ? h.change + '%' : 'N/A'}`,[m
+[32m+[m[32m    `  EMA20:  ${h?.ema20 || 'N/A'}`,[m
+[32m+[m[32m    `  EMA50:  ${h?.ema50 || 'N/A'}`,[m
+[32m+[m[32m    '',[m
+[32m+[m[32m    `_Fetched: ${new Date(ctx.fetchedAt).toUTCString()}_`,[m
+[32m+[m[32m  ].join('\n');[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction formatPriceSnapshot(snapshot) {[m
+[32m+[m[32m  const price = Number.isFinite(snapshot.price) ? `$${snapshot.price.toLocaleString('en-US')}` : 'N/A';[m
+[32m+[m[32m  const c1h = Number.isFinite(snapshot.change1h) ? `${snapshot.change1h.toFixed(2)}%` : 'N/A';[m
+[32m+[m[32m  const c24h = Number.isFinite(snapshot.change24h) ? `${snapshot.change24h.toFixed(2)}%` : 'N/A';[m
+[32m+[m[32m  const c7d = Number.isFinite(snapshot.change7d) ? `${snapshot.change7d.toFixed(2)}%` : 'N/A';[m
+[32m+[m[32m  const volume = Number.isFinite(snapshot.volume24h) ? `$${snapshot.volume24h.toLocaleString('en-US')}` : 'N/A';[m
+[32m+[m
+[32m+[m[32m  return [[m
+[32m+[m[32m    `*${snapshot.symbol} Price Snapshot*`,[m
+[32m+[m[32m    `━━━━━━━━━━━━━━━━━━━━`,[m
+[32m+[m[32m    `*Name:* ${snapshot.name}`,[m
+[32m+[m[32m    `*Price:* ${price}`,[m
+[32m+[m[32m    `*1H:* ${c1h}`,[m
+[32m+[m[32m    `*24H:* ${c24h}`,[m
+[32m+[m[32m    `*7D:* ${c7d}`,[m
+[32m+[m[32m    `*24H Volume:* ${volume}`,[m
+[32m+[m[32m    snapshot.marketCapRank ? `*Rank:* #${snapshot.marketCapRank}` : null,[m
+[32m+[m[32m    '',[m
+[32m+[m[32m    `_Fetched: ${new Date(snapshot.fetchedAt).toUTCString()}_`,[m
+[32m+[m[32m  ].filter(Boolean).join('\n');[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction addSpikeAlert(chatId, coinInput, threshold = DEFAULT_SPIKE_PERCENT) {[m
+[32m+[m[32m  const coinId = resolveCoinId(coinInput);[m
+[32m+[m[32m  const item = {[m
+[32m+[m[32m    coinId,[m
+[32m+[m[32m    label: String(coinInput).trim().toUpperCase().replace(/^\$/, ''),[m
+[32m+[m[32m    threshold: Math.max(0.5, Number(threshold) || DEFAULT_SPIKE_PERCENT),[m
+[32m+[m[32m    lastPrice: null,[m
+[32m+[m[32m    lastNotifiedAt: 0,[m
+[32m+[m[32m  };[m
+[32m+[m[32m  const alerts = alertsByChat.get(chatId) || [];[m
+[32m+[m[32m  const filtered = alerts.filter(alert => alert.coinId !== coinId);[m
+[32m+[m[32m  filtered.push(item);[m
+[32m+[m[32m  alertsByChat.set(chatId, filtered);[m
+[32m+[m[32m  return item;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction formatAlerts(chatId) {[m
+[32m+[m[32m  const alerts = alertsByChat.get(chatId) || [];[m
+[32m+[m[32m  if (!alerts.length) {[m
+[32m+[m[32m    return `*No spike alerts yet.*\n\nUse /alert BTC 3 or tap *Set Spike Alert* to watch for a percentage move between checks.`;[m
+[32m+[m[32m  }[m
+[32m+[m[32m  return [[m
+[32m+[m[32m    '*Active Spike Alerts*',[m
+[32m+[m[32m    '━━━━━━━━━━━━━━━━━━━━',[m
+[32m+[m[32m    ...alerts.map((alert, index) => {[m
+[32m+[m[32m      const last = alert.lastPrice ? `$${Number(alert.lastPrice).toLocaleString('en-US')}` : 'waiting for first check';[m
+[32m+[m[32m      return `${index + 1}. *${alert.label}* — ${alert.threshold}% move/check — ${last}`;[m
+[32m+[m[32m    }),[m
+[32m+[m[32m  ].join('\n');[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// ─── Handlers ────────────────────────────────────────────────────────────────[m
+[32m+[m
+[32m+[m[32masync function handleStart(chatId) {[m
+[32m+[m[32m  await sendMessage(chatId,[m
+[32m+[m[32m    `👋 *Welcome to ChartMind AI*\n\n` +[m
+[32m+[m[32m    `Send me a crypto chart screenshot and I'll give you a full institutional-grade analysis:\n\n` +[m
+[32m+[m[32m    `• Market trend & structure\n` +[m
+[32m+[m[32m    `• Support & resistance levels\n` +[m
+[32m+[m[32m    `• Trade setup (entry, stop, target)\n` +[m
+[32m+[m[32m    `• RSI, MACD, volume read\n` +[m
+[32m+[m[32m    `• Live BTC regime context\n\n` +[m
+[32m+[m[32m    `*Commands:*\n` +[m
+[32m+[m[32m    `/btc — Live BTC market snapshot\n` +[m
+[32m+[m[32m    `/price ETH — Price snapshot\n` +[m
+[32m+[m[32m    `/alert SOL 3 — Spike alert at 3% moves\n` +[m
+[32m+[m[32m    `/alerts — Active alerts\n` +[m
+[32m+[m[32m    `/clearalerts — Remove alerts\n` +[m
+[32m+[m[32m    `/help — Usage tips\n\n` +[m
+[32m+[m[32m    `Just send a chart photo to get started. 📊`,[m
+[32m+[m[32m    { reply_markup: mainKeyboard() }[m
+[32m+[m[32m  );[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32masync function handleHelp(chatId) {[m
+[32m+[m[32m  await sendMessage(chatId,[m
+[32m+[m[32m    `*📖 How to use ChartMind AI*\n\n` +[m
+[32m+[m[32m    `1. Screenshot your chart (TradingView, Binance, Bybit, etc.)\n` +[m
+[32m+[m[32m    `2. Send the photo directly in this chat\n` +[m
+[32m+[m[32m    `3. Wait ~15-30 seconds for analysis\n\n` +[m
+[32m+[m[32m    `*Tips for best results:*\n` +[m
+[32m+[m[32m    `• Include visible indicators (RSI, MACD, MAs)\n` +[m
+[32m+[m[32m    `• Make sure price labels and timeframe are visible\n` +[m
+[32m+[m[32m    `• One chart per message\n` +[m
+[32m+[m[32m    `• PNG or JPG, max 8MB\n\n` +[m
+[32m+[m[32m    `*Commands:*\n` +[m
+[32m+[m[32m    `/btc — BTC regime snapshot\n` +[m
+[32m+[m[32m    `/price BTC — Coin price snapshot\n` +[m
+[32m+[m[32m    `/alert ETH 3 — Alert if ETH moves 3% between checks\n` +[m
+[32m+[m[32m    `/alerts — Show active alerts\n` +[m
+[32m+[m[32m    `/clearalerts — Clear your alerts\n` +[m
+[32m+[m[32m    `/start — Welcome message`[m
+[32m+[m[32m    ,[m
+[32m+[m[32m    { reply_markup: mainKeyboard() }[m
+[32m+[m[32m  );[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32masync function handleBtc(chatId) {[m
+[32m+[m[32m  const msg = await sendMessage(chatId, '⏳ Fetching live BTC data...');[m
+[32m+[m[32m  try {[m
+[32m+[m[32m    const ctx = await getBitcoinMarketContext();[m
+[32m+[m[32m    await editMessage(chatId, msg.result.message_id, formatBtcSnapshot(ctx));[m
+[32m+[m[32m  } catch (err) {[m
+[32m+[m[32m    console.error('[bot] /btc error:', err.message);[m
+[32m+[m[32m    await editMessage(chatId, msg.result.message_id, '❌ Could not fetch BTC data. Try again.');[m
+[32m+[m[32m  }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32masync function handlePrice(chatId, text) {[m
+[32m+[m[32m  const [, coin = 'btc'] = String(text || '').trim().split(/\s+/);[m
+[32m+[m[32m  const msg = await sendMessage(chatId, `⏳ Fetching ${coin.toUpperCase()} price...`);[m
+[32m+[m[32m  try {[m
+[32m+[m[32m    const snapshot = await getCoinPriceSnapshot(coin);[m
+[32m+[m[32m    await editMessage(chatId, msg.result.message_id, formatPriceSnapshot(snapshot));[m
+[32m+[m[32m  } catch (err) {[m
+[32m+[m[32m    console.error('[bot] /price error:', err.message);[m
+[32m+[m[32m    await editMessage(chatId, msg.result.message_id, `❌ Could not fetch that coin. Try one of: ${supportedCoinList()}`);[m
+[32m+[m[32m  }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32masync function handleAlertCommand(chatId, text) {[m
+[32m+[m[32m  const [, coin, percent] = String(text || '').trim().split(/\s+/);[m
+[32m+[m[32m  if (!coin) {[m
+[32m+[m[32m    pendingByChat.set(chatId, 'alert');[m
+[32m+[m[32m    await sendMessage(chatId, `Send the alert as: BTC 3\n\nSupported quick symbols: ${supportedCoinList()}`);[m
+[32m+[m[32m    return;[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  const alert = addSpikeAlert(chatId, coin, percent);[m
+[32m+[m[32m  await sendMessage(chatId, `✅ Spike alert set for *${alert.label}* at *${alert.threshold}%* moves between checks.\n\nI check about every ${Math.round(ALERT_CHECK_MS / 1000)} seconds.`, {[m
+[32m+[m[32m    reply_markup: mainKeyboard(),[m
+[32m+[m[32m  });[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32masync function handlePendingText(chatId, text) {[m
+[32m+[m[32m  const pending = pendingByChat.get(chatId);[m
+[32m+[m[32m  if (!pending) return false;[m
+[32m+[m[32m  pendingByChat.delete(chatId);[m
+[32m+[m
+[32m+[m[32m  if (pending === 'alert') {[m
+[32m+[m[32m    const [coin, percent] = String(text || '').trim().split(/\s+/);[m
+[32m+[m[32m    if (!coin) {[m
+[32m+[m[32m      await sendMessage(chatId, 'I need a coin symbol. Example: BTC 3');[m
+[32m+[m[32m      return true;[m
+[32m+[m[32m    }[m
+[32m+[m[32m    const alert = addSpikeAlert(chatId, coin, percent);[m
+[32m+[m[32m    await sendMessage(chatId, `✅ Spike alert set for *${alert.label}* at *${alert.threshold}%* moves between checks.`, {[m
+[32m+[m[32m      reply_markup: mainKeyboard(),[m
+[32m+[m[32m    });[m
+[32m+[m[32m    return true;[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  return false;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32masync function handleCallback(query) {[m
+[32m+[m[32m  const chatId = query.message?.chat?.id;[m
+[32m+[m[32m  const messageId = query.message?.message_id;[m
+[32m+[m[32m  const data = query.data || '';[m
+[32m+[m[32m  if (!chatId) return;[m
+[32m+[m[32m  await answerCallback(query.id);[m
+[32m+[m
+[32m+[m[32m  if (data === 'btc') {[m
+[32m+[m[32m    await handleBtc(chatId);[m
+[32m+[m[32m    return;[m
+[32m+[m[32m  }[m
+[32m+[m[32m  if (data === 'help') {[m
+[32m+[m[32m    await handleHelp(chatId);[m
+[32m+[m[32m    return;[m
+[32m+[m[32m  }[m
+[32m+[m[32m  if (data === 'alerts') {[m
+[32m+[m[32m    await sendMessage(chatId, formatAlerts(chatId), { reply_markup: mainKeyboard() });[m
+[32m+[m[32m    return;[m
+[32m+[m[32m  }[m
+[32m+[m[32m  if (data === 'alert_menu') {[m
+[32m+[m[32m    pendingByChat.set(chatId, 'alert');[m
+[32m+[m[32m    await sendMessage(chatId, `Send coin and threshold like: BTC 3\n\nI will alert on fast percentage moves between checks.`, {[m
+[32m+[m[32m      reply_markup: {[m
+[32m+[m[32m        inline_keyboard: [[m
+[32m+[m[32m          [[m
+[32m+[m[32m            { text: 'BTC 3%', callback_data: 'quickalert:btc:3' },[m
+[32m+[m[32m            { text: 'ETH 3%', callback_data: 'quickalert:eth:3' },[m
+[32m+[m[32m            { text: 'SOL 4%', callback_data: 'quickalert:sol:4' },[m
+[32m+[m[32m          ],[m
+[32m+[m[32m          [{ text: 'Back', callback_data: 'menu' }],[m
+[32m+[m[32m        ],[m
+[32m+[m[32m      },[m
+[32m+[m[32m    });[m
+[32m+[m[32m    return;[m
+[32m+[m[32m  }[m
+[32m+[m[32m  if (data === 'menu') {[m
+[32m+[m[32m    await sendMessage(chatId, 'ChartMind controls:', { reply_markup: mainKeyboard() });[m
+[32m+[m[32m    return;[m
+[32m+[m[32m  }[m
+[32m+[m[32m  if (data.startsWith('price:')) {[m
+[32m+[m[32m    await handlePrice(chatId, `/price ${data.split(':')[1]}`);[m
+[32m+[m[32m    return;[m
+[32m+[m[32m  }[m
+[32m+[m[32m  if (data.startsWith('quickalert:')) {[m
+[32m+[m[32m    const [, coin, percent] = data.split(':');[m
+[32m+[m[32m    const alert = addSpikeAlert(chatId, coin, percent);[m
+[32m+[m[32m    pendingByChat.delete(chatId);[m
+[32m+[m[32m    await sendMessage(chatId, `✅ Spike alert set for *${alert.label}* at *${alert.threshold}%*.`, {[m
+[32m+[m[32m      reply_markup: mainKeyboard(),[m
+[32m+[m[32m    });[m
+[32m+[m[32m    return;[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  if (messageId) await sendMessage(chatId, 'Unknown button. Tap /start for the menu.');[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32masync function handlePhoto(chatId, photo) {[m
+[32m+[m[32m  const fileId    = photo[photo.length - 1].file_id;[m
+[32m+[m[32m  const statusMsg = await sendMessage(chatId, '📥 Chart received — starting analysis...\n_This takes 15–45 seconds on first run._');[m
+[32m+[m[32m  const statusId  = statusMsg.result?.message_id;[m
+[32m+[m[32m  const filesToClean = [];[m
+[32m+[m
+[32m+[m[32m  const btcPromise = getBitcoinMarketContext().catch(() => null);[m
+[32m+[m
+[32m+[m[32m  try {[m
+[32m+[m[32m    await editMessage(chatId, statusId, '⚙️ Downloading & preprocessing chart...');[m
+[32m+[m[32m    const tmpPath = await downloadFile(fileId);[m
+[32m+[m[32m    filesToClean.push(tmpPath);[m
+[32m+[m
+[32m+[m[32m    const processed = await preprocessChartImage(tmpPath);[m
+[32m+[m[32m    filesToClean.push(processed.analysisPath, processed.ocrPath);[m
+[32m+[m
+[32m+[m[32m    await editMessage(chatId, statusId, '🔍 Running OCR & fetching BTC regime...');[m
+[32m+[m[32m    const [ocrText, marketContext] = await Promise.all([[m
+[32m+[m[32m      extractChartText(processed.ocrPath),[m
+[32m+[m[32m      btcPromise,[m
+[32m+[m[32m    ]);[m
+[32m+[m
+[32m+[m[32m    await editMessage(chatId, statusId, '🤖 Analyzing chart with AI...');[m
+[32m+[m[32m    let analysis;[m
+[32m+[m[32m    try {[m
+[32m+[m[32m      analysis = await analyzeChart(processed.analysisPath, {[m
+[32m+[m[32m        mimeType: processed.mimeType, ocrText, marketContext, originalImage: processed.metadata,[m
+[32m+[m[32m      });[m
+[32m+[m[32m    } catch (geminiErr) {[m
+[32m+[m[32m      const isTransient = geminiErr.retryable !== false || geminiErr.statusCode >= 500;[m
+[32m+[m[32m      if (!isTransient) throw geminiErr;[m
+[32m+[m[32m      console.error('[bot] Gemini failed, trying OpenRouter fallback:', geminiErr.message);[m
+[32m+[m[32m      await editMessage(chatId, statusId, '⚡ Gemini busy — switching to fallback AI...');[m
+[32m+[m[32m      analysis = await analyzeChartWithOpenRouter(processed.analysisPath, {[m
+[32m+[m[32m        mimeType: processed.mimeType, ocrText, marketContext, originalImage: processed.metadata,[m
+[32m+[m[32m      });[m
+[32m+[m[32m    }[m
+[32m+[m[32m    analysis = addCodexAnalyst(analysis, { ocrText, marketContext });[m
+[32m+[m
+[32m+[m[32m    const report = formatAnalysis(analysis, marketContext);[m
+[32m+[m[32m    await tgPost('deleteMessage', { chat_id: chatId, message_id: statusId });[m
+[32m+[m[32m    await sendMessage(chatId, report);[m
+[32m+[m
+[32m+[m[32m  } catch (err) {[m
+[32m+[m[32m    console.error('[bot] photo handler error:', err);[m
+[32m+[m[32m    const errText = err.statusCode === 503[m
+[32m+[m[32m      ? '⚠️ *Both AI providers are temporarily busy.* Please retry in a moment.'[m
+[32m+[m[32m      : '❌ *Analysis failed.* Make sure the image is a clear chart screenshot and try again.';[m
+[32m+[m[32m    if (statusId) {[m
+[32m+[m[32m      await editMessage(chatId, statusId, errText).catch(() => sendMessage(chatId, errText));[m
+[32m+[m[32m    } else {[m
+[32m+[m[32m      await sendMessage(chatId, errText);[m
+[32m+[m[32m    }[m
+[32m+[m[32m  } finally {[m
+[32m+[m[32m    await Promise.all(filesToClean.map(p => fs.unlink(p).catch(() => {})));[m
+[32m+[m[32m  }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// ─── Polling loop ─────────────────────────────────────────────────────────────[m
+[32m+[m
+[32m+[m[32mlet offset = 0;[m
+[32m+[m
+[32m+[m[32masync function poll() {[m
+[32m+[m[32m  try {[m
+[32m+[m[32m    const res  = await fetch(`${API}/getUpdates?timeout=25&offset=${offset}&allowed_updates=["message","callback_query"]`);[m
+[32m+[m[32m    const data = await res.json();[m
+[32m+[m
+[32m+[m[32m    if (!data.ok) {[m
+[32m+[m[32m      console.error('[bot] getUpdates error:', data);[m
+[32m+[m[32m      return;[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    for (const update of data.result) {[m
+[32m+[m[32m      offset = update.update_id + 1;[m
+[32m+[m[32m      if (update.callback_query) {[m
+[32m+[m[32m        await handleCallback(update.callback_query);[m
+[32m+[m[32m        continue;[m
+[32m+[m[32m      }[m
+[32m+[m
+[32m+[m[32m      const msg = update.message;[m
+[32m+[m[32m      if (!msg) continue;[m
+[32m+[m[32m      const chatId = msg.chat.id;[m
+[32m+[m
+[32m+[m[32m      try {[m
+[32m+[m[32m        if (msg.photo) {[m
+[32m+[m[32m          await handlePhoto(chatId, msg.photo);[m
+[32m+[m[32m        } else if (msg.text) {[m
+[32m+[m[32m          if (await handlePendingText(chatId, msg.text)) continue;[m
+[32m+[m[32m          const cmd = msg.text.split(' ')[0].toLowerCase();[m
+[32m+[m[32m          if (cmd === '/start')     await handleStart(chatId);[m
+[32m+[m[32m          else if (cmd === '/help') await handleHelp(chatId);[m
+[32m+[m[32m          else if (cmd === '/btc')  await handleBtc(chatId);[m
+[32m+[m[32m          else if (cmd === '/price') await handlePrice(chatId, msg.text);[m
+[32m+[m[32m          else if (cmd === '/alert') await handleAlertCommand(chatId, msg.text);[m
+[32m+[m[32m          else if (cmd === '/alerts') await sendMessage(chatId, formatAlerts(chatId), { reply_markup: mainKeyboard() });[m
+[32m+[m[32m          else if (cmd === '/clearalerts') {[m
+[32m+[m[32m            alertsByChat.delete(chatId);[m
+[32m+[m[32m            await sendMessage(chatId, '✅ Cleared your spike alerts.', { reply_markup: mainKeyboard() });[m
+[32m+[m[32m          }[m
+[32m+[m[32m          else await sendMessage(chatId, '📊 Send me a chart screenshot, use the buttons, or type /help.', { reply_markup: mainKeyboard() });[m
+[32m+[m[32m        }[m
+[32m+[m[32m      } catch (err) {[m
+[32m+[m[32m        console.error(`[bot] handler error for chat ${chatId}:`, err.message);[m
+[32m+[m[32m      }[m
+[32m+[m[32m    }[m
+[32m+[m[32m  } catch (err) {[m
+[32m+[m[32m    console.error('[bot] poll error:', err.message);[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  setImmediate(poll);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32masync function checkSpikeAlerts() {[m
+[32m+[m[32m  for (const [chatId, alerts] of alertsByChat.entries()) {[m
+[32m+[m[32m    for (const alert of alerts) {[m
+[32m+[m[32m      try {[m
+[32m+[m[32m        const snapshot = await getCoinPriceSnapshot(alert.coinId);[m
+[32m+[m[32m        if (!Number.isFinite(snapshot.price)) continue;[m
+[32m+[m
+[32m+[m[32m        if (alert.lastPrice) {[m
+[32m+[m[32m          const move = ((snapshot.price - alert.lastPrice) / alert.lastPrice) * 100;[m
+[32m+[m[32m          const absMove = Math.abs(move);[m
+[32m+[m[32m          const cooledDown = Date.now() - alert.lastNotifiedAt > ALERT_CHECK_MS * 2;[m
+[32m+[m[32m          if (absMove >= alert.threshold && cooledDown) {[m
+[32m+[m[32m            alert.lastNotifiedAt = Date.now();[m
+[32m+[m[32m            const direction = move > 0 ? 'up' : 'down';[m
+[32m+[m[32m            await sendMessage(chatId,[m
+[32m+[m[32m              `🚨 *${snapshot.symbol} Spike Alert*\n\n` +[m
+[32m+[m[32m              `${snapshot.symbol} moved *${direction} ${absMove.toFixed(2)}%* since the last check.\n` +[m
+[32m+[m[32m              `Price: *$${snapshot.price.toLocaleString('en-US')}*\n` +[m
+[32m+[m[32m              `Threshold: ${alert.threshold}%`,[m
+[32m+[m[32m              { reply_markup: mainKeyboard() }[m
+[32m+[m[32m            );[m
+[32m+[m[32m          }[m
+[32m+[m[32m        }[m
+[32m+[m
+[32m+[m[32m        alert.lastPrice = snapshot.price;[m
+[32m+[m[32m        alert.label = snapshot.symbol;[m
+[32m+[m[32m      } catch (err) {[m
+[32m+[m[32m        console.error(`[bot] alert check failed for ${alert.coinId}:`, err.message);[m
+[32m+[m[32m      }[m
+[32m+[m[32m    }[m
+[32m+[m[32m  }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// ─── Export for server.js ─────────────────────────────────────────────────────[m
+[32m+[m
+[32m+[m[32mexport function startBot() {[m
+[32m+[m[32m  if (!TOKEN) {[m
+[32m+[m[32m    console.error('[bot] TELEGRAM_BOT_TOKEN not set — bot will not start');[m
+[32m+[m[32m    return;[m
+[32m+[m[32m  }[m
+[32m+[m[32m  console.log('[bot] ChartMind AI Telegram bot starting...');[m
+[32m+[m[32m  tgPost('getMe').then(info => {[m
+[32m+[m[32m    console.log(`[bot] Connected as @${info.result?.username}`);[m
+[32m+[m[32m    if (!alertTimer) {[m
+[32m+[m[32m      alertTimer = setInterval(checkSpikeAlerts, ALERT_CHECK_MS);[m
+[32m+[m[32m      alertTimer.unref?.();[m
+[32m+[m[32m    }[m
+[32m+[m[32m    poll();[m
+[32m+[m[32m  }).catch(err => {[m
+[32m+[m[32m    console.error('[bot] Failed to connect to Telegram:', err.message);[m
+[32m+[m[32m  });[m
+[32m+[m[32m}[m
+[1mdiff --git a/routes/analyze.js b/routes/analyze.js[m
+[1mindex 6e6f3b0..57d36e9 100644[m
+[1m--- a/routes/analyze.js[m
+[1m+++ b/routes/analyze.js[m
+[36m@@ -70,11 +70,13 @@[m [masync function runAIAnalysis(imagePath, extraData) {[m
+   } catch (geminiErr) {[m
+     console.error('[analyze] Gemini failed:', geminiErr.publicMessage || geminiErr.message);[m
+ [m
+[31m-    // Only fall through to OpenRouter if Gemini failed due to rate limit / overload / timeout[m
+[32m+[m[32m    // Fall through when Gemini is busy, rate-limited, or misconfigured and OpenRouter can still analyze.[m
+     const isRetryable = geminiErr.retryable !== false;[m
+     const isTransient  = geminiErr.statusCode === 503 || geminiErr.statusCode === 429 || geminiErr.statusCode === 504 || geminiErr.statusCode === 502;[m
+[32m+[m[32m    const canUseOpenRouter = Boolean(process.env.OPENROUTER_API_KEY);[m
+[32m+[m[32m    const isGeminiAuthOrConfig = geminiErr.statusCode === 400 || geminiErr.statusCode === 401 || geminiErr.statusCode === 403;[m
+ [m
+[31m-    if (!isRetryable && !isTransient) throw geminiErr;[m
+[32m+[m[32m    if (!canUseOpenRouter || (!isRetryable && !isTransient && !isGeminiAuthOrConfig)) throw geminiErr;[m
+ [m
+     // 2. Try OpenRouter (fallback)[m
+     try {[m
+[1mdiff --git a/routes/analyze.js.bak b/routes/analyze.js.bak[m
+[1mnew file mode 100644[m
+[1mindex 0000000..6e6f3b0[m
+[1m--- /dev/null[m
+[1m+++ b/routes/analyze.js.bak[m
+[36m@@ -0,0 +1,214 @@[m
+[32m+[m[32mimport express from 'express';[m
+[32m+[m[32mimport multer from 'multer';[m
+[32m+[m[32mimport fs from 'fs/promises';[m
+[32m+[m[32mimport path from 'path';[m
+[32m+[m
+[32m+[m[32mimport { analyzeChart }                    from '../services/gemini.js';[m
+[32m+[m[32mimport { analyzeChartWithOpenRouter }      from '../services/openrouter.js';[m
+[32m+[m[32mimport { getBitcoinMarketContext, btcCache } from '../services/marketData.js';[m
+[32m+[m[32mimport { extractChartText }                from '../services/ocr.js';[m
+[32m+[m[32mimport { preprocessChartImage }            from '../services/preprocess.js';[m
+[32m+[m[32mimport { addCodexAnalyst }                 from '../services/codexAnalyst.js';[m
+[32m+[m
+[32m+[m[32mconst router = express.Router();[m
+[32m+[m[32mconst MAX_FILE_SIZE_MB = Number(process.env.MAX_UPLOAD_MB || 8);[m
+[32m+[m[32mconst allowedMimeTypes = new Set(['image/png', 'image/jpeg', 'image/webp']);[m
+[32m+[m
+[32m+[m[32m// How long to wait for BTC market data before proceeding without it.[m
+[32m+[m[32m// Kept high for Render cold-start — but cached responses are instant.[m
+[32m+[m[32mconst BTC_FETCH_BUDGET_MS = Number(process.env.BTC_FETCH_BUDGET_MS || 15_000);[m
+[32m+[m
+[32m+[m[32mconst upload = multer({[m
+[32m+[m[32m  dest: 'uploads/',[m
+[32m+[m[32m  limits: { fileSize: MAX_FILE_SIZE_MB * 1024 * 1024, files: 1 },[m
+[32m+[m[32m  fileFilter: (_req, file, cb) => {[m
+[32m+[m[32m    if (!allowedMimeTypes.has(file.mimetype)) {[m
+[32m+[m[32m      cb(Object.assign(new Error('Upload a PNG, JPG, or WEBP chart screenshot.'), { statusCode: 415 }));[m
+[32m+[m[32m      return;[m
+[32m+[m[32m    }[m
+[32m+[m[32m    cb(null, true);[m
+[32m+[m[32m  },[m
+[32m+[m[32m});[m
+[32m+[m
+[32m+[m[32masync function removeQuietly(filePath) {[m
+[32m+[m[32m  if (!filePath) return;[m
+[32m+[m[32m  try { await fs.unlink(filePath); } catch {}[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction multerMiddleware(req, res) {[m
+[32m+[m[32m  return new Promise((resolve, reject) => {[m
+[32m+[m[32m    upload.single('image')(req, res, (error) => {[m
+[32m+[m[32m      if (!error) return resolve();[m
+[32m+[m[32m      if (error.code === 'LIMIT_FILE_SIZE') {[m
+[32m+[m[32m        return reject(Object.assign(new Error(`Image must be ${MAX_FILE_SIZE_MB}MB or smaller.`), { statusCode: 413 }));[m
+[32m+[m[32m      }[m
+[32m+[m[32m      reject(error);[m
+[32m+[m[32m    });[m
+[32m+[m[32m  });[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// Resolves with { value } or { timedOut: true } — never rejects.[m
+[32m+[m[32mfunction withBudget(promise, ms) {[m
+[32m+[m[32m  return new Promise((resolve) => {[m
+[32m+[m[32m    const timer = setTimeout(() => {[m
+[32m+[m[32m      console.warn(`[analyze] BTC budget (${ms}ms) exceeded — proceeding without market context`);[m
+[32m+[m[32m      resolve({ timedOut: true });[m
+[32m+[m[32m    }, ms);[m
+[32m+[m[32m    promise[m
+[32m+[m[32m      .then((value) => { clearTimeout(timer); resolve({ value }); })[m
+[32m+[m[32m      .catch((err)  => { clearTimeout(timer); console.error('[analyze] BTC fetch error:', err.message); resolve({ timedOut: true }); });[m
+[32m+[m[32m  });[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// ── AI provider chain: Gemini → OpenRouter ────────────────────────────────[m
+[32m+[m[32masync function runAIAnalysis(imagePath, extraData) {[m
+[32m+[m[32m  // 1. Try Gemini (primary)[m
+[32m+[m[32m  try {[m
+[32m+[m[32m    const result = await analyzeChart(imagePath, extraData);[m
+[32m+[m[32m    console.log('[analyze] AI provider: Gemini ✓');[m
+[32m+[m[32m    return result;[m
+[32m+[m[32m  } catch (geminiErr) {[m
+[32m+[m[32m    console.error('[analyze] Gemini failed:', geminiErr.publicMessage || geminiErr.message);[m
+[32m+[m
+[32m+[m[32m    // Only fall through to OpenRouter if Gemini failed due to rate limit / overload / timeout[m
+[32m+[m[32m    const isRetryable = geminiErr.retryable !== false;[m
+[32m+[m[32m    const isTransient  = geminiErr.statusCode === 503 || geminiErr.statusCode === 429 || geminiErr.statusCode === 504 || geminiErr.statusCode === 502;[m
+[32m+[m
+[32m+[m[32m    if (!isRetryable && !isTransient) throw geminiErr;[m
+[32m+[m
+[32m+[m[32m    // 2. Try OpenRouter (fallback)[m
+[32m+[m[32m    try {[m
+[32m+[m[32m      console.log('[analyze] Falling back to OpenRouter...');[m
+[32m+[m[32m      const result = await analyzeChartWithOpenRouter(imagePath, extraData);[m
+[32m+[m[32m      console.log('[analyze] AI provider: OpenRouter ✓');[m
+[32m+[m[32m      return result;[m
+[32m+[m[32m    } catch (orErr) {[m
+[32m+[m[32m      console.error('[analyze] OpenRouter also failed:', orErr.message);[m
+[32m+[m[32m      // Re-throw original Gemini error (more meaningful to caller)[m
+[32m+[m[32m      throw geminiErr;[m
+[32m+[m[32m    }[m
+[32m+[m[32m  }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction createFallbackAnalysis({ ocrText, marketContext, reason }) {[m
+[32m+[m[32m  return addCodexAnalyst({[m
+[32m+[m[32m    trend: 'neutral',[m
+[32m+[m[32m    marketStructure: 'AI vision analysis temporarily unavailable.',[m
+[32m+[m[32m    support: [], resistance: [],[m
+[32m+[m[32m    rsi: null, macd: 'Not confirmed',[m
+[32m+[m[32m    tradeSetup: {[m
+[32m+[m[32m      direction: 'NO TRADE', entry: null, stopLoss: null, takeProfit: null, riskReward: null,[m
+[32m+[m[32m      invalidation: 'Wait for full AI chart analysis before taking a setup.',[m
+[32m+[m[32m    },[m
+[32m+[m[32m    confidence: 15,[m
+[32m+[m[32m    warnings: [[m
+[32m+[m[32m      reason || 'Both AI providers unavailable. This is a fallback report.',[m
+[32m+[m[32m      'No trade should be taken from fallback mode alone.',[m
+[32m+[m[32m    ],[m
+[32m+[m[32m    summary: 'ChartMind processed the upload and market context, but both AI providers (Gemini + OpenRouter) could not complete visual chart reasoning. Please retry shortly.',[m
+[32m+[m[32m    keyObservations: [[m
+[32m+[m[32m      ocrText ? 'OCR extracted chart text for the next full analysis attempt.' : 'OCR did not extract enough chart text.',[m
+[32m+[m[32m      `BTC market regime context is ${marketContext?.trend || 'unknown'}.`,[m
+[32m+[m[32m    ],[m
+[32m+[m[32m    indicators: {},[m
+[32m+[m[32m    volumeAnalysis: 'Not confirmed without full AI analysis.',[m
+[32m+[m[32m    metadata: { pair: 'Not confirmed', timeframe: 'Not confirmed', exchange: 'Not confirmed', currentPrice: 'Not confirmed' },[m
+[32m+[m[32m    btcContext: marketContext?.note || 'BTC context available but AI chart reasoning unavailable.',[m
+[32m+[m[32m    provider: 'Fallback (no AI)',[m
+[32m+[m[32m    degraded: true,[m
+[32m+[m[32m  }, { ocrText, marketContext });[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mrouter.post('/', async (req, res) => {[m
+[32m+[m[32m  const filesToClean = [];[m
+[32m+[m[32m  let ocrText = '';[m
+[32m+[m[32m  let marketContext = null;[m
+[32m+[m
+[32m+[m[32m  // ── Kick off BTC fetch immediately on request arrival.[m
+[32m+[m[32m  // If a recent cached result exists it resolves in <1ms.[m
+[32m+[m[32m  const btcFetchPromise = withBudget([m
+[32m+[m[32m    getBitcoinMarketContext(),[m
+[32m+[m[32m    btcCache.fresh() ? 500 : BTC_FETCH_BUDGET_MS,[m
+[32m+[m[32m  );[m
+[32m+[m
+[32m+[m[32m  try {[m
+[32m+[m[32m    await multerMiddleware(req, res);[m
+[32m+[m
+[32m+[m[32m    if (!req.file) {[m
+[32m+[m[32m      return res.status(400).json({[m
+[32m+[m[32m        success: false,[m
+[32m+[m[32m        error: { code: 'NO_IMAGE', message: 'Upload a chart screenshot before running analysis.' },[m
+[32m+[m[32m      });[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    filesToClean.push(req.file.path);[m
+[32m+[m
+[32m+[m[32m    // Preprocess + OCR + BTC all race in parallel[m
+[32m+[m[32m    const [processed, btcResult] = await Promise.all([[m
+[32m+[m[32m      preprocessChartImage(req.file.path),[m
+[32m+[m[32m      btcFetchPromise,[m
+[32m+[m[32m    ]);[m
+[32m+[m
+[32m+[m[32m    filesToClean.push(processed.analysisPath, processed.ocrPath);[m
+[32m+[m
+[32m+[m[32m    // OCR runs on already-preprocessed file; BTC may already be done[m
+[32m+[m[32m    ocrText = await extractChartText(processed.ocrPath);[m
+[32m+[m[32m    marketContext = btcResult.timedOut ? null : btcResult.value;[m
+[32m+[m
+[32m+[m[32m    if (marketContext) {[m
+[32m+[m[32m      console.log(`[analyze] BTC ready — source: ${marketContext.source}, trend: ${marketContext.trend}`);[m
+[32m+[m[32m    } else {[m
+[32m+[m[32m      console.warn('[analyze] Proceeding without BTC context');[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    const analysis = addCodexAnalyst(await runAIAnalysis(processed.analysisPath, {[m
+[32m+[m[32m      mimeType: processed.mimeType,[m
+[32m+[m[32m      ocrText,[m
+[32m+[m[32m      marketContext,[m
+[32m+[m[32m      originalImage: processed.metadata,[m
+[32m+[m[32m    }), { ocrText, marketContext });[m
+[32m+[m
+[32m+[m[32m    return res.json({[m
+[32m+[m[32m      success: true,[m
+[32m+[m[32m      data: {[m
+[32m+[m[32m        analysis,[m
+[32m+[m[32m        ocrText,[m
+[32m+[m[32m        marketContext,[m
+[32m+[m[32m        preprocessing: {[m
+[32m+[m[32m          resized: true, contrastEnhanced: true, ocrOptimized: true, compressed: true,[m
+[32m+[m[32m          original: processed.metadata,[m
+[32m+[m[32m        },[m
+[32m+[m[32m      },[m
+[32m+[m[32m    });[m
+[32m+[m[32m  } catch (error) {[m
+[32m+[m[32m    const status = error.statusCode || 500;[m
+[32m+[m[32m    if (status >= 500) console.error('[analyze]', error);[m
+[32m+[m
+[32m+[m[32m    if (status === 503 && (ocrText || marketContext)) {[m
+[32m+[m[32m      return res.status(200).json({[m
+[32m+[m[32m        success: true,[m
+[32m+[m[32m        data: {[m
+[32m+[m[32m          analysis: createFallbackAnalysis({ ocrText, marketContext, reason: error.publicMessage || error.message }),[m
+[32m+[m[32m          ocrText, marketContext,[m
+[32m+[m[32m          preprocessing: { resized: true, contrastEnhanced: true, ocrOptimized: true, compressed: true, degraded: true },[m
+[32m+[m[32m        },[m
+[32m+[m[32m      });[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    return res.status(status).json({[m
+[32m+[m[32m      success: false,[m
+[32m+[m[32m      error: {[m
+[32m+[m[32m        code: status >= 500 ? 'ANALYSIS_FAILED' : 'INVALID_UPLOAD',[m
+[32m+[m[32m        message: error.publicMessage || (status >= 500[m
+[32m+[m[32m          ? 'ChartMind could not complete analysis right now. Please retry.'[m
+[32m+[m[32m          : error.message),[m
+[32m+[m[32m        detail: process.env.NODE_ENV === 'production' ? undefined : error.message,[m
+[32m+[m[32m      },[m
+[32m+[m[32m    });[m
+[32m+[m[32m  } finally {[m
+[32m+[m[32m    await Promise.all(filesToClean.map(removeQuietly));[m
+[32m+[m[32m    try { await fs.mkdir(path.resolve('uploads'), { recursive: true }); } catch {}[m
+[32m+[m[32m  }[m
+[32m+[m[32m});[m
+[32m+[m
+[32m+[m[32mexport default router;[m
