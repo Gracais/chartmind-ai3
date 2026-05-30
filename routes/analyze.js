@@ -8,6 +8,7 @@ import { analyzeChartWithOpenRouter }      from '../services/openrouter.js';
 import { getBitcoinMarketContext, btcCache } from '../services/marketData.js';
 import { extractChartText }                from '../services/ocr.js';
 import { preprocessChartImage }            from '../services/preprocess.js';
+import { addCodexAnalyst }                 from '../services/codexAnalyst.js';
 
 const router = express.Router();
 const MAX_FILE_SIZE_MB = Number(process.env.MAX_UPLOAD_MB || 8);
@@ -90,7 +91,7 @@ async function runAIAnalysis(imagePath, extraData) {
 }
 
 function createFallbackAnalysis({ ocrText, marketContext, reason }) {
-  return {
+  return addCodexAnalyst({
     trend: 'neutral',
     marketStructure: 'AI vision analysis temporarily unavailable.',
     support: [], resistance: [],
@@ -115,7 +116,7 @@ function createFallbackAnalysis({ ocrText, marketContext, reason }) {
     btcContext: marketContext?.note || 'BTC context available but AI chart reasoning unavailable.',
     provider: 'Fallback (no AI)',
     degraded: true,
-  };
+  }, { ocrText, marketContext });
 }
 
 router.post('/', async (req, res) => {
@@ -160,12 +161,12 @@ router.post('/', async (req, res) => {
       console.warn('[analyze] Proceeding without BTC context');
     }
 
-    const analysis = await runAIAnalysis(processed.analysisPath, {
+    const analysis = addCodexAnalyst(await runAIAnalysis(processed.analysisPath, {
       mimeType: processed.mimeType,
       ocrText,
       marketContext,
       originalImage: processed.metadata,
-    });
+    }), { ocrText, marketContext });
 
     return res.json({
       success: true,

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 
 import analyzeRoute from './routes/analyze.js';
 import btcRoute     from './routes/btc.js';
+import { startBot } from './bot.js';
 
 dotenv.config();
 
@@ -55,17 +56,15 @@ app.use((error, _req, res, next) => {
 const PORT = process.env.PORT || 3000;
 
 const server = app.listen(PORT, () => {
-  console.log(
-    `ChartMind AI running on port ${PORT}`
-  );
+  console.log(`ChartMind AI running on port ${PORT}`);
+  startBot();
 });
 
 server.on('error', (error) => {
   if (error.code === 'EADDRINUSE') {
-    console.error(`Port ${PORT} is already in use. Set PORT to an available port and restart ChartMind AI.`);
+    console.error(`Port ${PORT} is already in use.`);
     process.exit(1);
   }
-
   console.error('ChartMind AI failed to start:', error);
   process.exit(1);
 });

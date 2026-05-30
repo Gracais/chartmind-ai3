@@ -29,6 +29,21 @@ cuts typical latency by 5-15 seconds.
 `GET /btc` returns live (or cached) BTC market data without an image upload.
 Used by the page pre-warm and available for any other integrations.
 
+### 5. Telegram buttons + spike alerts
+The Telegram bot now opens with inline buttons for BTC regime, quick BTC/ETH
+prices, alert setup, active alerts, and help.
+
+Commands:
+```
+/price ETH       # Price snapshot from CoinGecko
+/alert SOL 4     # Alert when SOL moves 4% between checks
+/alerts          # Show active spike alerts
+/clearalerts     # Remove your alerts
+```
+
+Spike alerts are in-memory and reset when the Node process restarts. For
+production persistence, back `alertsByChat` with Redis, SQLite, or Postgres.
+
 ## Stack
 - **Express** — web server
 - **Gemini API** — visual chart analysis (primary)
@@ -49,6 +64,8 @@ Used by the page pre-warm and available for any other integrations.
 └── services/
     ├── gemini.js           # Gemini API (primary AI)
     ├── openrouter.js       # OpenRouter API (fallback AI)  ← NEW
+    ├── codexAnalyst.js     # Codex risk audit / second opinion
+    ├── coinPrices.js       # CoinGecko price snapshots for bot alerts
     ├── marketData.js       # BTC data + in-memory cache    ← UPDATED
     ├── ocr.js              # Tesseract OCR
     └── preprocess.js       # Sharp image pipeline

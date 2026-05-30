@@ -1,14 +1,3 @@
-/**
- * ChartMind AI — Telegram Bot
- * 
- * Commands:
- *   /start   — welcome message
- *   /help    — usage instructions
- *   /btc     — live BTC regime snapshot (no image needed)
- * 
- * Send any photo → full chart analysis
- */
-
 import 'dotenv/config';
 import fs from 'fs/promises';
 import path from 'path';
@@ -17,18 +6,21 @@ import fetch from 'node-fetch';
 
 import { analyzeChart }               from './services/gemini.js';
 import { analyzeChartWithOpenRouter } from './services/openrouter.js';
-import { getBitcoinMarketContext } from './services/marketData.js';
-import { extractChartText }     from './services/ocr.js';
-import { preprocessChartImage } from './services/preprocess.js';
+import { getBitcoinMarketContext }    from './services/marketData.js';
+import { extractChartText }           from './services/ocr.js';
+import { preprocessChartImage }       from './services/preprocess.js';
+import { addCodexAnalyst }            from './services/codexAnalyst.js';
+import { getCoinPriceSnapshot, resolveCoinId, supportedCoinList } from './services/coinPrices.js';
 
-const TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
-const API     = `https://api.telegram.org/bot${TOKEN}`;
+const TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
+const API      = `https://api.telegram.org/bot${TOKEN}`;
 const FILE_API = `https://api.telegram.org/file/bot${TOKEN}`;
+const ALERT_CHECK_MS = Number(process.env.ALERT_CHECK_MS || 60_000);
+const DEFAULT_SPIKE_PERCENT = Number(process.env.DEFAULT_SPIKE_PERCENT || 3);
 
-if (!TOKEN) {
-  console.error('TELEGRAM_BOT_TOKEN is not set in .env');
-  process.exit(1);
-}
+const alertsByChat = new Map();
+const pendingByChat = new Map();
+let alertTimer = null;
 
 // ─── Telegram API helpers ────────────────────────────────────────────────────
 
@@ -39,6 +31,32 @@ async function tgPost(method, body) {
     body: JSON.stringify(body),
   });
   return res.json();
+}
+
+function mainKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: 'BTC Regime', callback_data: 'btc' },
+        { text: 'Price BTC', callback_data: 'price:btc' },
+        { text: 'Price ETH', callback_data: 'price:eth' },
+      ],
+      [
+        { text: 'Set Spike Alert', callback_data: 'alert_menu' },
+        { text: 'My Alerts', callback_data: 'alerts' },
+        { text: 'Help', callback_data: 'help' },
+      ],
+    ],
+  };
+}
+
+async function answerCallback(callbackQueryId, text = '') {
+  if (!callbackQueryId) return;
+  await tgPost('answerCallbackQuery', {
+    callback_query_id: callbackQueryId,
+    text,
+    show_alert: false,
+  });
 }
 
 async function sendMessage(chatId, text, extra = {}) {
@@ -60,22 +78,18 @@ async function editMessage(chatId, messageId, text) {
 }
 
 async function downloadFile(fileId) {
-  // Get file path from Telegram
   const info = await fetch(`${API}/getFile?file_id=${fileId}`).then(r => r.json());
   if (!info.ok) throw new Error('Could not get file info from Telegram');
-  
   const filePath = info.result.file_path;
   const ext      = path.extname(filePath) || '.jpg';
   const tmpPath  = path.join(os.tmpdir(), `cm_${Date.now()}${ext}`);
-
-  // Download the actual file
   const fileRes  = await fetch(`${FILE_API}/${filePath}`);
   const buffer   = await fileRes.arrayBuffer();
   await fs.writeFile(tmpPath, Buffer.from(buffer));
   return tmpPath;
 }
 
-// ─── Format analysis into readable Telegram message ─────────────────────────
+// ─── Formatters ──────────────────────────────────────────────────────────────
 
 function trendEmoji(trend) {
   if (!trend) return '⚪';
@@ -88,8 +102,8 @@ function trendEmoji(trend) {
 function directionEmoji(direction) {
   if (!direction) return '⚪';
   const d = direction.toUpperCase();
-  if (d.includes('LONG'))  return '📈';
-  if (d.includes('SHORT')) return '📉';
+  if (d.includes('BUY')  || d.includes('LONG'))  return '📈';
+  if (d.includes('SELL') || d.includes('SHORT')) return '📉';
   return '⏸';
 }
 
@@ -99,71 +113,59 @@ function formatAnalysis(analysis, marketContext) {
   const btc = marketContext?.intraday;
   const te  = trendEmoji(analysis.trend);
   const de  = directionEmoji(s.direction);
-
   const lines = [];
 
-  // Header
   lines.push(`*📊 ChartMind AI — Trading Desk Brief*`);
   lines.push(`━━━━━━━━━━━━━━━━━━━━`);
-
-  // Metadata
   lines.push(`*Pair:* ${m.pair || 'Unknown'}`);
   lines.push(`*Timeframe:* ${m.timeframe || 'Unknown'}`);
   lines.push(`*Price:* ${m.currentPrice || 'Unknown'}`);
   lines.push(`*Exchange:* ${m.exchange || 'Unknown'}`);
   lines.push('');
-
-  // Market trend
   lines.push(`*Market Trend:* ${te} ${(analysis.trend || 'neutral').toUpperCase()}`);
   lines.push(`*Confidence:* ${analysis.confidence}/100`);
   if (analysis.marketStructure) lines.push(`${analysis.marketStructure}`);
   lines.push('');
-
-  // Trade setup
   lines.push(`*${de} Setup: ${s.direction || 'NO TRADE'}*`);
-  if (s.entry)      lines.push(`  Entry:       \`${s.entry}\``);
-  if (s.stopLoss)   lines.push(`  Stop Loss:   \`${s.stopLoss}\``);
-  if (s.takeProfit) lines.push(`  Take Profit: \`${s.takeProfit}\``);
-  if (s.riskReward) lines.push(`  R:R Ratio:   ${s.riskReward}`);
+  if (s.entry)        lines.push(`  Entry:        \`${s.entry}\``);
+  if (s.stopLoss)     lines.push(`  Stop Loss:    \`${s.stopLoss}\``);
+  if (s.takeProfit)   lines.push(`  Take Profit:  \`${s.takeProfit}\``);
+  if (s.riskReward)   lines.push(`  R:R Ratio:    ${s.riskReward}`);
   if (s.invalidation) lines.push(`  Invalidation: ${s.invalidation}`);
   lines.push('');
-
-  // Key levels
   if (analysis.support?.length)    lines.push(`*Support:* ${analysis.support.join(' | ')}`);
   if (analysis.resistance?.length) lines.push(`*Resistance:* ${analysis.resistance.join(' | ')}`);
   if (analysis.support?.length || analysis.resistance?.length) lines.push('');
-
-  // Indicators
   if (analysis.rsi)  lines.push(`*RSI:* ${analysis.rsi}`);
   if (analysis.macd && analysis.macd !== 'Not visible') lines.push(`*MACD:* ${analysis.macd}`);
   if (analysis.volumeAnalysis && analysis.volumeAnalysis !== 'Not visible') {
     lines.push(`*Volume:* ${analysis.volumeAnalysis}`);
   }
   lines.push('');
-
-  // BTC context
   if (btc && marketContext?.trend !== 'unknown') {
     lines.push(`*BTC Regime:* ${trendEmoji(marketContext.trend)} ${marketContext.trend?.toUpperCase()}`);
     lines.push(`  Price: $${btc.price?.toLocaleString() || 'N/A'}  |  RSI: ${btc.rsi || 'N/A'}`);
     lines.push('');
   }
-
-  // Summary
   lines.push(`*Summary*`);
   lines.push(analysis.summary || 'No summary.');
   lines.push('');
-
-  // Warnings
   if (analysis.warnings?.length) {
     lines.push(`⚠️ ${analysis.warnings.join('\n⚠️ ')}`);
     lines.push('');
   }
-
-  // Degraded notice
-  if (analysis.degraded) {
-    lines.push(`_⚡ Fallback mode — Gemini unavailable. Retry for full analysis._`);
+  if (analysis.codexAnalyst) {
+    lines.push(`*Codex Second Opinion:* ${analysis.codexAnalyst.verdict}`);
+    lines.push(`  Score: ${analysis.codexAnalyst.score}/100  |  BTC: ${analysis.codexAnalyst.alignment}`);
+    if (analysis.codexAnalyst.note) lines.push(`  ${analysis.codexAnalyst.note}`);
+    lines.push('');
   }
-
+  if (analysis.provider && analysis.provider !== 'Gemini') {
+    lines.push(`_⚡ Analyzed by ${analysis.provider}_`);
+  }
+  if (analysis.degraded) {
+    lines.push(`_⚠️ Fallback mode — retry for full analysis._`);
+  }
   return lines.join('\n');
 }
 
@@ -171,8 +173,8 @@ function formatBtcSnapshot(ctx) {
   if (!ctx || ctx.trend === 'unknown') {
     return '❌ *BTC market data unavailable right now.* Try again in a moment.';
   }
-  const i = ctx.intraday;
-  const h = ctx.higherTimeframe;
+  const i  = ctx.intraday;
+  const h  = ctx.higherTimeframe;
   const te = trendEmoji(ctx.trend);
   return [
     `*🟠 BTC Regime Snapshot*`,
@@ -196,6 +198,59 @@ function formatBtcSnapshot(ctx) {
   ].join('\n');
 }
 
+function formatPriceSnapshot(snapshot) {
+  const price = Number.isFinite(snapshot.price) ? `$${snapshot.price.toLocaleString('en-US')}` : 'N/A';
+  const c1h = Number.isFinite(snapshot.change1h) ? `${snapshot.change1h.toFixed(2)}%` : 'N/A';
+  const c24h = Number.isFinite(snapshot.change24h) ? `${snapshot.change24h.toFixed(2)}%` : 'N/A';
+  const c7d = Number.isFinite(snapshot.change7d) ? `${snapshot.change7d.toFixed(2)}%` : 'N/A';
+  const volume = Number.isFinite(snapshot.volume24h) ? `$${snapshot.volume24h.toLocaleString('en-US')}` : 'N/A';
+
+  return [
+    `*${snapshot.symbol} Price Snapshot*`,
+    `━━━━━━━━━━━━━━━━━━━━`,
+    `*Name:* ${snapshot.name}`,
+    `*Price:* ${price}`,
+    `*1H:* ${c1h}`,
+    `*24H:* ${c24h}`,
+    `*7D:* ${c7d}`,
+    `*24H Volume:* ${volume}`,
+    snapshot.marketCapRank ? `*Rank:* #${snapshot.marketCapRank}` : null,
+    '',
+    `_Fetched: ${new Date(snapshot.fetchedAt).toUTCString()}_`,
+  ].filter(Boolean).join('\n');
+}
+
+function addSpikeAlert(chatId, coinInput, threshold = DEFAULT_SPIKE_PERCENT) {
+  const coinId = resolveCoinId(coinInput);
+  const item = {
+    coinId,
+    label: String(coinInput).trim().toUpperCase().replace(/^\$/, ''),
+    threshold: Math.max(0.5, Number(threshold) || DEFAULT_SPIKE_PERCENT),
+    lastPrice: null,
+    lastNotifiedAt: 0,
+  };
+  const alerts = alertsByChat.get(chatId) || [];
+  const filtered = alerts.filter(alert => alert.coinId !== coinId);
+  filtered.push(item);
+  alertsByChat.set(chatId, filtered);
+  return item;
+}
+
+function formatAlerts(chatId) {
+  const alerts = alertsByChat.get(chatId) || [];
+  if (!alerts.length) {
+    return `*No spike alerts yet.*\n\nUse /alert BTC 3 or tap *Set Spike Alert* to watch for a percentage move between checks.`;
+  }
+  return [
+    '*Active Spike Alerts*',
+    '━━━━━━━━━━━━━━━━━━━━',
+    ...alerts.map((alert, index) => {
+      const last = alert.lastPrice ? `$${Number(alert.lastPrice).toLocaleString('en-US')}` : 'waiting for first check';
+      return `${index + 1}. *${alert.label}* — ${alert.threshold}% move/check — ${last}`;
+    }),
+  ].join('\n');
+}
+
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
 async function handleStart(chatId) {
@@ -209,8 +264,13 @@ async function handleStart(chatId) {
     `• Live BTC regime context\n\n` +
     `*Commands:*\n` +
     `/btc — Live BTC market snapshot\n` +
+    `/price ETH — Price snapshot\n` +
+    `/alert SOL 3 — Spike alert at 3% moves\n` +
+    `/alerts — Active alerts\n` +
+    `/clearalerts — Remove alerts\n` +
     `/help — Usage tips\n\n` +
-    `Just send a chart photo to get started. 📊`
+    `Just send a chart photo to get started. 📊`,
+    { reply_markup: mainKeyboard() }
   );
 }
 
@@ -226,8 +286,14 @@ async function handleHelp(chatId) {
     `• One chart per message\n` +
     `• PNG or JPG, max 8MB\n\n` +
     `*Commands:*\n` +
-    `/btc — BTC regime snapshot (no image needed)\n` +
+    `/btc — BTC regime snapshot\n` +
+    `/price BTC — Coin price snapshot\n` +
+    `/alert ETH 3 — Alert if ETH moves 3% between checks\n` +
+    `/alerts — Show active alerts\n` +
+    `/clearalerts — Clear your alerts\n` +
     `/start — Welcome message`
+    ,
+    { reply_markup: mainKeyboard() }
   );
 }
 
@@ -242,22 +308,120 @@ async function handleBtc(chatId) {
   }
 }
 
-async function handlePhoto(chatId, photo) {
-  // Telegram sends multiple sizes — take the largest (last)
-  const fileId = photo[photo.length - 1].file_id;
+async function handlePrice(chatId, text) {
+  const [, coin = 'btc'] = String(text || '').trim().split(/\s+/);
+  const msg = await sendMessage(chatId, `⏳ Fetching ${coin.toUpperCase()} price...`);
+  try {
+    const snapshot = await getCoinPriceSnapshot(coin);
+    await editMessage(chatId, msg.result.message_id, formatPriceSnapshot(snapshot));
+  } catch (err) {
+    console.error('[bot] /price error:', err.message);
+    await editMessage(chatId, msg.result.message_id, `❌ Could not fetch that coin. Try one of: ${supportedCoinList()}`);
+  }
+}
 
+async function handleAlertCommand(chatId, text) {
+  const [, coin, percent] = String(text || '').trim().split(/\s+/);
+  if (!coin) {
+    pendingByChat.set(chatId, 'alert');
+    await sendMessage(chatId, `Send the alert as: BTC 3\n\nSupported quick symbols: ${supportedCoinList()}`);
+    return;
+  }
+
+  const alert = addSpikeAlert(chatId, coin, percent);
+  await sendMessage(chatId, `✅ Spike alert set for *${alert.label}* at *${alert.threshold}%* moves between checks.\n\nI check about every ${Math.round(ALERT_CHECK_MS / 1000)} seconds.`, {
+    reply_markup: mainKeyboard(),
+  });
+}
+
+async function handlePendingText(chatId, text) {
+  const pending = pendingByChat.get(chatId);
+  if (!pending) return false;
+  pendingByChat.delete(chatId);
+
+  if (pending === 'alert') {
+    const [coin, percent] = String(text || '').trim().split(/\s+/);
+    if (!coin) {
+      await sendMessage(chatId, 'I need a coin symbol. Example: BTC 3');
+      return true;
+    }
+    const alert = addSpikeAlert(chatId, coin, percent);
+    await sendMessage(chatId, `✅ Spike alert set for *${alert.label}* at *${alert.threshold}%* moves between checks.`, {
+      reply_markup: mainKeyboard(),
+    });
+    return true;
+  }
+
+  return false;
+}
+
+async function handleCallback(query) {
+  const chatId = query.message?.chat?.id;
+  const messageId = query.message?.message_id;
+  const data = query.data || '';
+  if (!chatId) return;
+  await answerCallback(query.id);
+
+  if (data === 'btc') {
+    await handleBtc(chatId);
+    return;
+  }
+  if (data === 'help') {
+    await handleHelp(chatId);
+    return;
+  }
+  if (data === 'alerts') {
+    await sendMessage(chatId, formatAlerts(chatId), { reply_markup: mainKeyboard() });
+    return;
+  }
+  if (data === 'alert_menu') {
+    pendingByChat.set(chatId, 'alert');
+    await sendMessage(chatId, `Send coin and threshold like: BTC 3\n\nI will alert on fast percentage moves between checks.`, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: 'BTC 3%', callback_data: 'quickalert:btc:3' },
+            { text: 'ETH 3%', callback_data: 'quickalert:eth:3' },
+            { text: 'SOL 4%', callback_data: 'quickalert:sol:4' },
+          ],
+          [{ text: 'Back', callback_data: 'menu' }],
+        ],
+      },
+    });
+    return;
+  }
+  if (data === 'menu') {
+    await sendMessage(chatId, 'ChartMind controls:', { reply_markup: mainKeyboard() });
+    return;
+  }
+  if (data.startsWith('price:')) {
+    await handlePrice(chatId, `/price ${data.split(':')[1]}`);
+    return;
+  }
+  if (data.startsWith('quickalert:')) {
+    const [, coin, percent] = data.split(':');
+    const alert = addSpikeAlert(chatId, coin, percent);
+    pendingByChat.delete(chatId);
+    await sendMessage(chatId, `✅ Spike alert set for *${alert.label}* at *${alert.threshold}%*.`, {
+      reply_markup: mainKeyboard(),
+    });
+    return;
+  }
+
+  if (messageId) await sendMessage(chatId, 'Unknown button. Tap /start for the menu.');
+}
+
+async function handlePhoto(chatId, photo) {
+  const fileId    = photo[photo.length - 1].file_id;
   const statusMsg = await sendMessage(chatId, '📥 Chart received — starting analysis...\n_This takes 15–45 seconds on first run._');
   const statusId  = statusMsg.result?.message_id;
-
   const filesToClean = [];
 
-  // Kick off BTC fetch immediately
   const btcPromise = getBitcoinMarketContext().catch(() => null);
 
-  let tmpPath = null;
   try {
     await editMessage(chatId, statusId, '⚙️ Downloading & preprocessing chart...');
-    tmpPath = await downloadFile(fileId);
+    const tmpPath = await downloadFile(fileId);
     filesToClean.push(tmpPath);
 
     const processed = await preprocessChartImage(tmpPath);
@@ -284,17 +448,16 @@ async function handlePhoto(chatId, photo) {
         mimeType: processed.mimeType, ocrText, marketContext, originalImage: processed.metadata,
       });
     }
+    analysis = addCodexAnalyst(analysis, { ocrText, marketContext });
 
     const report = formatAnalysis(analysis, marketContext);
-
-    // Delete the status message, send the real report
     await tgPost('deleteMessage', { chat_id: chatId, message_id: statusId });
     await sendMessage(chatId, report);
 
   } catch (err) {
     console.error('[bot] photo handler error:', err);
     const errText = err.statusCode === 503
-      ? '⚠️ *Both AI providers are temporarily busy.* Your chart processed fine — please retry in a moment.'
+      ? '⚠️ *Both AI providers are temporarily busy.* Please retry in a moment.'
       : '❌ *Analysis failed.* Make sure the image is a clear chart screenshot and try again.';
     if (statusId) {
       await editMessage(chatId, statusId, errText).catch(() => sendMessage(chatId, errText));
@@ -302,18 +465,17 @@ async function handlePhoto(chatId, photo) {
       await sendMessage(chatId, errText);
     }
   } finally {
-    // Delete all temp files immediately
     await Promise.all(filesToClean.map(p => fs.unlink(p).catch(() => {})));
   }
 }
 
-// ─── Polling loop ────────────────────────────────────────────────────────────
+// ─── Polling loop ─────────────────────────────────────────────────────────────
 
 let offset = 0;
 
 async function poll() {
   try {
-    const res  = await fetch(`${API}/getUpdates?timeout=25&offset=${offset}&allowed_updates=["message"]`);
+    const res  = await fetch(`${API}/getUpdates?timeout=25&offset=${offset}&allowed_updates=["message","callback_query"]`);
     const data = await res.json();
 
     if (!data.ok) {
@@ -323,7 +485,12 @@ async function poll() {
 
     for (const update of data.result) {
       offset = update.update_id + 1;
-      const msg    = update.message;
+      if (update.callback_query) {
+        await handleCallback(update.callback_query);
+        continue;
+      }
+
+      const msg = update.message;
       if (!msg) continue;
       const chatId = msg.chat.id;
 
@@ -331,11 +498,19 @@ async function poll() {
         if (msg.photo) {
           await handlePhoto(chatId, msg.photo);
         } else if (msg.text) {
+          if (await handlePendingText(chatId, msg.text)) continue;
           const cmd = msg.text.split(' ')[0].toLowerCase();
-          if (cmd === '/start')      await handleStart(chatId);
-          else if (cmd === '/help')  await handleHelp(chatId);
-          else if (cmd === '/btc')   await handleBtc(chatId);
-          else await sendMessage(chatId, '📊 Send me a chart screenshot to analyze it, or type /help for instructions.');
+          if (cmd === '/start')     await handleStart(chatId);
+          else if (cmd === '/help') await handleHelp(chatId);
+          else if (cmd === '/btc')  await handleBtc(chatId);
+          else if (cmd === '/price') await handlePrice(chatId, msg.text);
+          else if (cmd === '/alert') await handleAlertCommand(chatId, msg.text);
+          else if (cmd === '/alerts') await sendMessage(chatId, formatAlerts(chatId), { reply_markup: mainKeyboard() });
+          else if (cmd === '/clearalerts') {
+            alertsByChat.delete(chatId);
+            await sendMessage(chatId, '✅ Cleared your spike alerts.', { reply_markup: mainKeyboard() });
+          }
+          else await sendMessage(chatId, '📊 Send me a chart screenshot, use the buttons, or type /help.', { reply_markup: mainKeyboard() });
         }
       } catch (err) {
         console.error(`[bot] handler error for chat ${chatId}:`, err.message);
@@ -345,17 +520,58 @@ async function poll() {
     console.error('[bot] poll error:', err.message);
   }
 
-  // Keep polling
   setImmediate(poll);
 }
 
-// ─── Start ───────────────────────────────────────────────────────────────────
+async function checkSpikeAlerts() {
+  for (const [chatId, alerts] of alertsByChat.entries()) {
+    for (const alert of alerts) {
+      try {
+        const snapshot = await getCoinPriceSnapshot(alert.coinId);
+        if (!Number.isFinite(snapshot.price)) continue;
 
-console.log('[bot] ChartMind AI Telegram bot starting...');
-tgPost('getMe').then(info => {
-  console.log(`[bot] Connected as @${info.result?.username}`);
-  poll();
-}).catch(err => {
-  console.error('[bot] Failed to connect to Telegram:', err.message);
-  process.exit(1);
-});
+        if (alert.lastPrice) {
+          const move = ((snapshot.price - alert.lastPrice) / alert.lastPrice) * 100;
+          const absMove = Math.abs(move);
+          const cooledDown = Date.now() - alert.lastNotifiedAt > ALERT_CHECK_MS * 2;
+          if (absMove >= alert.threshold && cooledDown) {
+            alert.lastNotifiedAt = Date.now();
+            const direction = move > 0 ? 'up' : 'down';
+            await sendMessage(chatId,
+              `🚨 *${snapshot.symbol} Spike Alert*\n\n` +
+              `${snapshot.symbol} moved *${direction} ${absMove.toFixed(2)}%* since the last check.\n` +
+              `Price: *$${snapshot.price.toLocaleString('en-US')}*\n` +
+              `Threshold: ${alert.threshold}%`,
+              { reply_markup: mainKeyboard() }
+            );
+          }
+        }
+
+        alert.lastPrice = snapshot.price;
+        alert.label = snapshot.symbol;
+      } catch (err) {
+        console.error(`[bot] alert check failed for ${alert.coinId}:`, err.message);
+      }
+    }
+  }
+}
+
+// ─── Export for server.js ─────────────────────────────────────────────────────
+
+export function startBot() {
+  if (!TOKEN) {
+    console.error('[bot] TELEGRAM_BOT_TOKEN not set — bot will not start');
+    return;
+  }
+  console.log('[bot] ChartMind AI Telegram bot starting...');
+  tgPost('getMe').then(info => {
+    console.log(`[bot] Connected as @${info.result?.username}`);
+    if (!alertTimer) {
+      alertTimer = setInterval(checkSpikeAlerts, ALERT_CHECK_MS);
+      alertTimer.unref?.();
+    }
+    poll();
+  }).catch(err => {
+    console.error('[bot] Failed to connect to Telegram:', err.message);
+  });
+}

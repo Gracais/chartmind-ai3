@@ -175,9 +175,9 @@ async function getCoinGeckoContext() {
     note: 'Use BTC as broad crypto market regime context. Do not override the uploaded chart setup with BTC data.' };
 }
 
-// ─── Main export ─────────────────────────────────────────────────────────────
+// ─── Raw fetch (private) ──────────────────────────────────────────────────────
 
-export async function getBitcoinMarketContext() {
+async function _fetchBitcoinMarketContext() {
   // Try Binance first
   try {
     const ctx = await getBinanceContext();
@@ -253,10 +253,10 @@ export const btcCache = (() => {
   };
 })();
 
-// Wrap getBitcoinMarketContext with caching + deduplication.
-const _rawGetBitcoinMarketContext = getBitcoinMarketContext;
+// Wrap _fetchBitcoinMarketContext with caching + deduplication.
 
-// Re-export with cache layer
+// ─── Main export ─────────────────────────────────────────────────────────────
+
 export async function getBitcoinMarketContext() {
   // Cache hit — return instantly
   const cached = btcCache.get();
@@ -273,7 +273,7 @@ export async function getBitcoinMarketContext() {
   }
 
   // Start a new fetch
-  const promise = _rawGetBitcoinMarketContext().then((ctx) => {
+  const promise = _fetchBitcoinMarketContext().then((ctx) => {
     btcCache.set(ctx);
     return ctx;
   });
