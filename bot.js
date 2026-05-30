@@ -9,12 +9,14 @@
  * Send any photo → full chart analysis
  */
 
+import 'dotenv/config';
 import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
 import fetch from 'node-fetch';
 
-import { analyzeChart }         from './services/gemini.js';
+import { analyzeChart }               from './services/gemini.js';
+import { analyzeChartWithOpenRouter } from './services/openrouter.js';
 import { getBitcoinMarketContext } from './services/marketData.js';
 import { extractChartText }     from './services/ocr.js';
 import { preprocessChartImage } from './services/preprocess.js';
@@ -24,7 +26,8 @@ const API     = `https://api.telegram.org/bot${TOKEN}`;
 const FILE_API = `https://api.telegram.org/file/bot${TOKEN}`;
 
 if (!TOKEN) {
-  console.warn('[bot] TELEGRAM_BOT_TOKEN not set — Telegram bot will not start.');
+  console.error('TELEGRAM_BOT_TOKEN is not set in .env');
+  process.exit(1);
 }
 
 // ─── Telegram API helpers ────────────────────────────────────────────────────
@@ -266,13 +269,21 @@ async function handlePhoto(chatId, photo) {
       btcPromise,
     ]);
 
-    await editMessage(chatId, statusId, '🤖 Analyzing chart with Gemini AI...');
-    const analysis = await analyzeChart(processed.analysisPath, {
-      mimeType: processed.mimeType,
-      ocrText,
-      marketContext,
-      originalImage: processed.metadata,
-    });
+    await editMessage(chatId, statusId, '🤖 Analyzing chart with AI...');
+    let analysis;
+    try {
+      analysis = await analyzeChart(processed.analysisPath, {
+        mimeType: processed.mimeType, ocrText, marketContext, originalImage: processed.metadata,
+      });
+    } catch (geminiErr) {
+      const isTransient = geminiErr.retryable !== false || geminiErr.statusCode >= 500;
+      if (!isTransient) throw geminiErr;
+      console.error('[bot] Gemini failed, trying OpenRouter fallback:', geminiErr.message);
+      await editMessage(chatId, statusId, '⚡ Gemini busy — switching to fallback AI...');
+      analysis = await analyzeChartWithOpenRouter(processed.analysisPath, {
+        mimeType: processed.mimeType, ocrText, marketContext, originalImage: processed.metadata,
+      });
+    }
 
     const report = formatAnalysis(analysis, marketContext);
 
@@ -283,7 +294,7 @@ async function handlePhoto(chatId, photo) {
   } catch (err) {
     console.error('[bot] photo handler error:', err);
     const errText = err.statusCode === 503
-      ? '⚠️ *Gemini is temporarily overloaded.* Your chart processed fine — please retry in a moment.'
+      ? '⚠️ *Both AI providers are temporarily busy.* Your chart processed fine — please retry in a moment.'
       : '❌ *Analysis failed.* Make sure the image is a clear chart screenshot and try again.';
     if (statusId) {
       await editMessage(chatId, statusId, errText).catch(() => sendMessage(chatId, errText));
@@ -338,18 +349,13 @@ async function poll() {
   setImmediate(poll);
 }
 
-// ─── Export ──────────────────────────────────────────────────────────────────
+// ─── Start ───────────────────────────────────────────────────────────────────
 
-export function startBot() {
-  if (!TOKEN) {
-    console.warn('[bot] Skipping Telegram bot — no token.');
-    return;
-  }
-  console.log('[bot] ChartMind AI Telegram bot starting...');
-  tgPost('getMe').then(info => {
-    console.log(`[bot] Connected as @${info.result?.username}`);
-    poll();
-  }).catch(err => {
-    console.error('[bot] Failed to connect to Telegram:', err.message);
-  });
-}
+console.log('[bot] ChartMind AI Telegram bot starting...');
+tgPost('getMe').then(info => {
+  console.log(`[bot] Connected as @${info.result?.username}`);
+  poll();
+}).catch(err => {
+  console.error('[bot] Failed to connect to Telegram:', err.message);
+  process.exit(1);
+});

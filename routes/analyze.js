@@ -3,25 +3,23 @@ import multer from 'multer';
 import fs from 'fs/promises';
 import path from 'path';
 
-import { analyzeChart } from '../services/gemini.js';
-import { getBitcoinMarketContext } from '../services/marketData.js';
-import { extractChartText } from '../services/ocr.js';
-import { preprocessChartImage } from '../services/preprocess.js';
+import { analyzeChart }                    from '../services/gemini.js';
+import { analyzeChartWithOpenRouter }      from '../services/openrouter.js';
+import { getBitcoinMarketContext, btcCache } from '../services/marketData.js';
+import { extractChartText }                from '../services/ocr.js';
+import { preprocessChartImage }            from '../services/preprocess.js';
 
 const router = express.Router();
 const MAX_FILE_SIZE_MB = Number(process.env.MAX_UPLOAD_MB || 8);
 const allowedMimeTypes = new Set(['image/png', 'image/jpeg', 'image/webp']);
 
-// How long to wait for BTC market data before giving up and proceeding without it.
-// Set high so Render's slow cold-start network has time to complete.
-const BTC_FETCH_BUDGET_MS = Number(process.env.BTC_FETCH_BUDGET_MS || 55_000);
+// How long to wait for BTC market data before proceeding without it.
+// Kept high for Render cold-start — but cached responses are instant.
+const BTC_FETCH_BUDGET_MS = Number(process.env.BTC_FETCH_BUDGET_MS || 15_000);
 
 const upload = multer({
   dest: 'uploads/',
-  limits: {
-    fileSize: MAX_FILE_SIZE_MB * 1024 * 1024,
-    files: 1,
-  },
+  limits: { fileSize: MAX_FILE_SIZE_MB * 1024 * 1024, files: 1 },
   fileFilter: (_req, file, cb) => {
     if (!allowedMimeTypes.has(file.mimetype)) {
       cb(Object.assign(new Error('Upload a PNG, JPG, or WEBP chart screenshot.'), { statusCode: 415 }));
@@ -48,12 +46,11 @@ function multerMiddleware(req, res) {
   });
 }
 
-// Wraps a promise with a wall-clock deadline.
-// Resolves with { value } on success, { timedOut: true } on timeout — never rejects.
+// Resolves with { value } or { timedOut: true } — never rejects.
 function withBudget(promise, ms) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
-      console.warn(`[analyze] BTC fetch budget (${ms}ms) exceeded — proceeding without market context`);
+      console.warn(`[analyze] BTC budget (${ms}ms) exceeded — proceeding without market context`);
       resolve({ timedOut: true });
     }, ms);
     promise
@@ -62,41 +59,61 @@ function withBudget(promise, ms) {
   });
 }
 
+// ── AI provider chain: Gemini → OpenRouter ────────────────────────────────
+async function runAIAnalysis(imagePath, extraData) {
+  // 1. Try Gemini (primary)
+  try {
+    const result = await analyzeChart(imagePath, extraData);
+    console.log('[analyze] AI provider: Gemini ✓');
+    return result;
+  } catch (geminiErr) {
+    console.error('[analyze] Gemini failed:', geminiErr.publicMessage || geminiErr.message);
+
+    // Only fall through to OpenRouter if Gemini failed due to rate limit / overload / timeout
+    const isRetryable = geminiErr.retryable !== false;
+    const isTransient  = geminiErr.statusCode === 503 || geminiErr.statusCode === 429 || geminiErr.statusCode === 504 || geminiErr.statusCode === 502;
+
+    if (!isRetryable && !isTransient) throw geminiErr;
+
+    // 2. Try OpenRouter (fallback)
+    try {
+      console.log('[analyze] Falling back to OpenRouter...');
+      const result = await analyzeChartWithOpenRouter(imagePath, extraData);
+      console.log('[analyze] AI provider: OpenRouter ✓');
+      return result;
+    } catch (orErr) {
+      console.error('[analyze] OpenRouter also failed:', orErr.message);
+      // Re-throw original Gemini error (more meaningful to caller)
+      throw geminiErr;
+    }
+  }
+}
+
 function createFallbackAnalysis({ ocrText, marketContext, reason }) {
   return {
     trend: 'neutral',
-    marketStructure: 'AI vision analysis is temporarily unavailable, so no chart structure is confirmed.',
-    support: [],
-    resistance: [],
-    rsi: null,
-    macd: 'Not confirmed',
+    marketStructure: 'AI vision analysis temporarily unavailable.',
+    support: [], resistance: [],
+    rsi: null, macd: 'Not confirmed',
     tradeSetup: {
-      direction: 'NO TRADE',
-      entry: null,
-      stopLoss: null,
-      takeProfit: null,
-      riskReward: null,
+      direction: 'NO TRADE', entry: null, stopLoss: null, takeProfit: null, riskReward: null,
       invalidation: 'Wait for full AI chart analysis before taking a setup.',
     },
     confidence: 15,
     warnings: [
-      reason || 'AI provider unavailable. This is a fallback report, not a full chart read.',
+      reason || 'Both AI providers unavailable. This is a fallback report.',
       'No trade should be taken from fallback mode alone.',
     ],
-    summary: 'ChartMind processed the upload and market context, but the AI provider could not complete visual chart reasoning. Retry once Gemini quota or availability is restored.',
+    summary: 'ChartMind processed the upload and market context, but both AI providers (Gemini + OpenRouter) could not complete visual chart reasoning. Please retry shortly.',
     keyObservations: [
-      ocrText ? 'OCR extracted chart text for the next full analysis attempt.' : 'OCR did not extract enough chart text from this image.',
+      ocrText ? 'OCR extracted chart text for the next full analysis attempt.' : 'OCR did not extract enough chart text.',
       `BTC market regime context is ${marketContext?.trend || 'unknown'}.`,
     ],
     indicators: {},
-    volumeAnalysis: 'Not confirmed without full AI chart analysis.',
-    metadata: {
-      pair: 'Not confirmed',
-      timeframe: 'Not confirmed',
-      exchange: 'Not confirmed',
-      currentPrice: 'Not confirmed',
-    },
-    btcContext: marketContext?.note || 'BTC context is available but full AI chart reasoning is unavailable.',
+    volumeAnalysis: 'Not confirmed without full AI analysis.',
+    metadata: { pair: 'Not confirmed', timeframe: 'Not confirmed', exchange: 'Not confirmed', currentPrice: 'Not confirmed' },
+    btcContext: marketContext?.note || 'BTC context available but AI chart reasoning unavailable.',
+    provider: 'Fallback (no AI)',
     degraded: true,
   };
 }
@@ -106,9 +123,12 @@ router.post('/', async (req, res) => {
   let ocrText = '';
   let marketContext = null;
 
-  // ── Kick off BTC fetch IMMEDIATELY on request arrival, before anything else.
-  // This gives it the maximum possible time while the image is being processed.
-  const btcFetchPromise = withBudget(getBitcoinMarketContext(), BTC_FETCH_BUDGET_MS);
+  // ── Kick off BTC fetch immediately on request arrival.
+  // If a recent cached result exists it resolves in <1ms.
+  const btcFetchPromise = withBudget(
+    getBitcoinMarketContext(),
+    btcCache.fresh() ? 500 : BTC_FETCH_BUDGET_MS,
+  );
 
   try {
     await multerMiddleware(req, res);
@@ -122,26 +142,25 @@ router.post('/', async (req, res) => {
 
     filesToClean.push(req.file.path);
 
-    // Preprocess image + OCR in parallel while BTC fetch is already running in background
-    const processed = await preprocessChartImage(req.file.path);
-    filesToClean.push(processed.analysisPath, processed.ocrPath);
-
-    // Wait for OCR and BTC fetch together (BTC fetch may already be done by now)
-    const [ocrResult, btcResult] = await Promise.all([
-      extractChartText(processed.ocrPath),
+    // Preprocess + OCR + BTC all race in parallel
+    const [processed, btcResult] = await Promise.all([
+      preprocessChartImage(req.file.path),
       btcFetchPromise,
     ]);
 
-    ocrText = ocrResult;
+    filesToClean.push(processed.analysisPath, processed.ocrPath);
+
+    // OCR runs on already-preprocessed file; BTC may already be done
+    ocrText = await extractChartText(processed.ocrPath);
     marketContext = btcResult.timedOut ? null : btcResult.value;
 
     if (marketContext) {
-      console.log(`[analyze] BTC context ready — source: ${marketContext.source}, trend: ${marketContext.trend}`);
+      console.log(`[analyze] BTC ready — source: ${marketContext.source}, trend: ${marketContext.trend}`);
     } else {
-      console.warn('[analyze] Proceeding without BTC context (timed out or failed)');
+      console.warn('[analyze] Proceeding without BTC context');
     }
 
-    const analysis = await analyzeChart(processed.analysisPath, {
+    const analysis = await runAIAnalysis(processed.analysisPath, {
       mimeType: processed.mimeType,
       ocrText,
       marketContext,
@@ -155,31 +174,21 @@ router.post('/', async (req, res) => {
         ocrText,
         marketContext,
         preprocessing: {
-          resized: true,
-          contrastEnhanced: true,
-          ocrOptimized: true,
-          compressed: true,
+          resized: true, contrastEnhanced: true, ocrOptimized: true, compressed: true,
           original: processed.metadata,
         },
       },
     });
   } catch (error) {
     const status = error.statusCode || 500;
-    if (status >= 500) {
-      console.error('[analyze]', error);
-    }
+    if (status >= 500) console.error('[analyze]', error);
 
     if (status === 503 && (ocrText || marketContext)) {
       return res.status(200).json({
         success: true,
         data: {
-          analysis: createFallbackAnalysis({
-            ocrText,
-            marketContext,
-            reason: error.publicMessage || error.message,
-          }),
-          ocrText,
-          marketContext,
+          analysis: createFallbackAnalysis({ ocrText, marketContext, reason: error.publicMessage || error.message }),
+          ocrText, marketContext,
           preprocessing: { resized: true, contrastEnhanced: true, ocrOptimized: true, compressed: true, degraded: true },
         },
       });
@@ -190,16 +199,14 @@ router.post('/', async (req, res) => {
       error: {
         code: status >= 500 ? 'ANALYSIS_FAILED' : 'INVALID_UPLOAD',
         message: error.publicMessage || (status >= 500
-          ? 'ChartMind could not complete the AI analysis right now. Please retry in a moment.'
+          ? 'ChartMind could not complete analysis right now. Please retry.'
           : error.message),
         detail: process.env.NODE_ENV === 'production' ? undefined : error.message,
       },
     });
   } finally {
     await Promise.all(filesToClean.map(removeQuietly));
-    try {
-      await fs.mkdir(path.resolve('uploads'), { recursive: true });
-    } catch {}
+    try { await fs.mkdir(path.resolve('uploads'), { recursive: true }); } catch {}
   }
 });
 

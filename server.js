@@ -6,7 +6,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 import analyzeRoute from './routes/analyze.js';
-import { startBot } from './bot.js';
+import btcRoute     from './routes/btc.js';
 
 dotenv.config();
 
@@ -24,8 +24,9 @@ app.use(express.json({
   limit: '25mb'
 }));
 
-// API routes before static so /analyze isn't shadowed
+// API routes before static so they aren't shadowed
 app.use('/analyze', analyzeRoute);
+app.use('/btc',     btcRoute);
 
 // Serve static files from root
 app.use(express.static(__dirname));
@@ -54,9 +55,9 @@ app.use((error, _req, res, next) => {
 const PORT = process.env.PORT || 3000;
 
 const server = app.listen(PORT, () => {
-  console.log(`ChartMind AI running on port ${PORT}`);
-  // Start Telegram bot in the same process
-  startBot();
+  console.log(
+    `ChartMind AI running on port ${PORT}`
+  );
 });
 
 server.on('error', (error) => {

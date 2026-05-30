@@ -214,3 +214,70 @@ export async function getBitcoinMarketContext() {
     error: 'BTC market context unavailable during this analysis.',
   };
 }
+
+
+// ─── In-memory BTC cache ─────────────────────────────────────────────────────
+// Caches the last successful BTC context for up to 90 seconds.
+// This means repeat requests (web UI retries, bot users) get instant
+// market data instead of waiting for a full provider round-trip.
+
+const CACHE_TTL_MS = Number(process.env.BTC_CACHE_TTL_MS || 90_000); // 90 s
+
+export const btcCache = (() => {
+  let _data      = null;
+  let _fetchedAt = 0;
+  let _inflight  = null; // deduplicate concurrent fetches
+
+  return {
+    /** True if a valid, non-expired result is sitting in cache. */
+    fresh() {
+      return _data !== null && Date.now() - _fetchedAt < CACHE_TTL_MS;
+    },
+
+    /** Returns cached data or null. */
+    get() {
+      return this.fresh() ? _data : null;
+    },
+
+    set(data) {
+      _data      = data;
+      _fetchedAt = Date.now();
+    },
+
+    /** Deduplication: if a fetch is already in-flight, return the same promise. */
+    getInflight() { return _inflight; },
+    setInflight(p) {
+      _inflight = p;
+      p.finally(() => { _inflight = null; });
+    },
+  };
+})();
+
+// Wrap getBitcoinMarketContext with caching + deduplication.
+const _rawGetBitcoinMarketContext = getBitcoinMarketContext;
+
+// Re-export with cache layer
+export async function getBitcoinMarketContext() {
+  // Cache hit — return instantly
+  const cached = btcCache.get();
+  if (cached) {
+    console.log('[marketData] Cache hit — BTC:', cached.intraday?.price);
+    return cached;
+  }
+
+  // Deduplicate: if a fetch is already running, wait for it
+  const existing = btcCache.getInflight();
+  if (existing) {
+    console.log('[marketData] Joining in-flight BTC fetch');
+    return existing;
+  }
+
+  // Start a new fetch
+  const promise = _rawGetBitcoinMarketContext().then((ctx) => {
+    btcCache.set(ctx);
+    return ctx;
+  });
+
+  btcCache.setInflight(promise);
+  return promise;
+}

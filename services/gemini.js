@@ -85,6 +85,7 @@ function normalizeAnalysis(raw) {
       currentPrice: metadata.currentPrice || raw.currentPrice || 'Not visible',
     },
     btcContext: raw.btcContext || raw.marketContext || null,
+    provider: 'Gemini',
     futureHooks: {
       telegramAlerts: false,
       discordIntegration: false,

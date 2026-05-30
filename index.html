@@ -336,7 +336,20 @@
   const resultsDiv = document.getElementById('results');
   const btcMini = document.getElementById('btcMini');
 
-  uploadZone.addEventListener('click', () => fileInput.click());
+  // Pre-warm BTC data as soon as page loads so it's cached when user hits Analyze
+  // This shaves several seconds off the first analysis on warm pages
+  (async () => {
+    try {
+      const res = await fetch('/btc');
+      const data = await res.json();
+      if (data?.data?.intraday?.price && btcMini) {
+        const trend = data.data.trend || 'unknown';
+        btcMini.textContent = `${trend.toUpperCase()} · $${Number(data.data.intraday.price).toLocaleString()}`;
+      }
+    } catch {
+      // Silent — pre-warm failure doesn't block anything
+    }
+  })();
   uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('drag'); });
   uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag'));
   uploadZone.addEventListener('drop', e => { e.preventDefault(); uploadZone.classList.remove('drag'); handleFile(e.dataTransfer.files[0]); });
@@ -379,7 +392,7 @@
     if (!selectedFile) return showError('Upload a chart screenshot first.');
     btnAnalyze.disabled = true;
     btnAnalyze.innerHTML = 'PROCESSING IMAGE + BTC CONTEXT <div class="loading-bar"></div>';
-    hideError(); showNotice('Running OCR, BTC regime check, and Gemini analysis...');
+    hideError(); showNotice('Running OCR, BTC regime check, and AI analysis...');
     resultsDiv.innerHTML = emptyLoadingShell('Building trading brief...');
 
     try {
@@ -427,7 +440,7 @@
     ].map(([label, value, tone]) => `<div class="trade-card"><span>${label}</span><b style="color:${tone}">${formatValue(value, 'N/A')}</b></div>`).join('');
 
     resultsDiv.innerHTML = `<div class="results">
-      <div class="results-top"><div><div class="eyebrow">Analysis Report</div><h2 class="section-title" style="margin-top:8px">Trading Desk Brief</h2></div><div class="pill">${new Date().toLocaleTimeString()}</div></div>
+      <div class="results-top"><div><div class="eyebrow">Analysis Report</div><h2 class="section-title" style="margin-top:8px">Trading Desk Brief</h2></div><div style="display:flex;gap:8px;align-items:center"><div class="pill" style="background:${a.provider?.includes('OpenRouter') ? '#2a1f00' : a.provider?.includes('Fallback') ? '#2a0000' : 'var(--card)'}; color:${a.provider?.includes('OpenRouter') ? 'var(--amber)' : a.provider?.includes('Fallback') ? 'var(--danger)' : 'var(--mint)'}; border:1px solid ${a.provider?.includes('OpenRouter') ? 'var(--amber)' : a.provider?.includes('Fallback') ? 'var(--danger)' : 'rgba(100,220,160,.3)'}">${escapeHtml(a.provider || 'Gemini')}</div><div class="pill">${new Date().toLocaleTimeString()}</div></div></div>
       <div class="grid-4">
         <div class="stat"><span>Pair</span><b>${formatValue(meta.pair, 'N/A')}</b></div>
         <div class="stat"><span>Timeframe</span><b>${formatValue(meta.timeframe, 'N/A')}</b></div>
