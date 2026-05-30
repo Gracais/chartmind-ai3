@@ -4,21 +4,23 @@ import path from 'path';
 import os from 'os';
 import fetch from 'node-fetch';
 
-import { analyzeChart }               from './services/gemini.js';
-import { analyzeChartWithOpenRouter } from './services/openrouter.js';
-import { getBitcoinMarketContext }    from './services/marketData.js';
-import { extractChartText }           from './services/ocr.js';
-import { preprocessChartImage }       from './services/preprocess.js';
-import { addCodexAnalyst }            from './services/codexAnalyst.js';
+import { analyzeChart as analyzeChartGPT }      from './services/chatgpt.js';
+import { analyzeChart as analyzeChartClaude }   from './services/claude.js';
+import { analyzeChartWithOpenRouter }            from './services/openrouter.js';
+import { getBitcoinMarketContext }               from './services/marketData.js';
+import { extractChartText }                      from './services/ocr.js';
+import { preprocessChartImage }                  from './services/preprocess.js';
+import { addCodexAnalyst }                       from './services/codexAnalyst.js';
 import { getCoinPriceSnapshot, resolveCoinId, supportedCoinList } from './services/coinPrices.js';
+import { analyzeWithNews, fetchCryptoNews, formatNewsDigest } from './services/news.js';
 
 const TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const API      = `https://api.telegram.org/bot${TOKEN}`;
 const FILE_API = `https://api.telegram.org/file/bot${TOKEN}`;
-const ALERT_CHECK_MS = Number(process.env.ALERT_CHECK_MS || 60_000);
+const ALERT_CHECK_MS        = Number(process.env.ALERT_CHECK_MS || 60_000);
 const DEFAULT_SPIKE_PERCENT = Number(process.env.DEFAULT_SPIKE_PERCENT || 3);
 
-const alertsByChat = new Map();
+const alertsByChat  = new Map();
 const pendingByChat = new Map();
 let alertTimer = null;
 
@@ -37,14 +39,18 @@ function mainKeyboard() {
   return {
     inline_keyboard: [
       [
-        { text: 'BTC Regime', callback_data: 'btc' },
-        { text: 'Price BTC', callback_data: 'price:btc' },
-        { text: 'Price ETH', callback_data: 'price:eth' },
+        { text: 'BTC Regime',  callback_data: 'btc' },
+        { text: 'Price BTC',   callback_data: 'price:btc' },
+        { text: 'Price ETH',   callback_data: 'price:eth' },
+      ],
+      [
+        { text: '📰 News BTC', callback_data: 'news:bitcoin' },
+        { text: '📰 News ETH', callback_data: 'news:ethereum' },
       ],
       [
         { text: 'Set Spike Alert', callback_data: 'alert_menu' },
-        { text: 'My Alerts', callback_data: 'alerts' },
-        { text: 'Help', callback_data: 'help' },
+        { text: 'My Alerts',       callback_data: 'alerts' },
+        { text: 'Help',            callback_data: 'help' },
       ],
     ],
   };
@@ -87,6 +93,49 @@ async function downloadFile(fileId) {
   const buffer   = await fileRes.arrayBuffer();
   await fs.writeFile(tmpPath, Buffer.from(buffer));
   return tmpPath;
+}
+
+// ─── AI provider chain: GPT → Claude → OpenRouter ───────────────────────────
+
+async function analyzeWithFallbacks(imagePath, payload, statusId, chatId) {
+  // 1️⃣ GPT primary
+  if (process.env.OPENAI_API_KEY) {
+    try {
+      await editMessage(chatId, statusId, '🤖 Analyzing chart with ChatGPT...');
+      const result = await analyzeChartGPT(imagePath, payload);
+      result.provider = 'ChatGPT';
+      return result;
+    } catch (err) {
+      console.error('[bot] ChatGPT failed:', err.message);
+      // fall through
+    }
+  }
+
+  // 2️⃣ Claude fallback
+  if (process.env.CLAUDE_API_KEY) {
+    try {
+      await editMessage(chatId, statusId, '🤖 ChatGPT busy — switching to Claude...');
+      const result = await analyzeChartClaude(imagePath, payload);
+      result.provider = 'Claude';
+      return result;
+    } catch (err) {
+      console.error('[bot] Claude failed:', err.message);
+      // fall through
+    }
+  }
+
+  // 3️⃣ OpenRouter last resort
+  if (process.env.OPENROUTER_API_KEY) {
+    await editMessage(chatId, statusId, '⚡ Switching to fallback AI provider...');
+    const result = await analyzeChartWithOpenRouter(imagePath, payload);
+    result.provider = result.provider || 'OpenRouter';
+    return result;
+  }
+
+  throw Object.assign(new Error('No AI providers configured.'), {
+    statusCode: 503,
+    publicMessage: 'No AI providers are configured. Please set OPENAI_API_KEY, CLAUDE_API_KEY, or OPENROUTER_API_KEY.',
+  });
 }
 
 // ─── Formatters ──────────────────────────────────────────────────────────────
@@ -160,7 +209,7 @@ function formatAnalysis(analysis, marketContext) {
     if (analysis.codexAnalyst.note) lines.push(`  ${analysis.codexAnalyst.note}`);
     lines.push('');
   }
-  if (analysis.provider && analysis.provider !== 'Gemini') {
+  if (analysis.provider) {
     lines.push(`_⚡ Analyzed by ${analysis.provider}_`);
   }
   if (analysis.degraded) {
@@ -199,12 +248,11 @@ function formatBtcSnapshot(ctx) {
 }
 
 function formatPriceSnapshot(snapshot) {
-  const price = Number.isFinite(snapshot.price) ? `$${snapshot.price.toLocaleString('en-US')}` : 'N/A';
-  const c1h = Number.isFinite(snapshot.change1h) ? `${snapshot.change1h.toFixed(2)}%` : 'N/A';
-  const c24h = Number.isFinite(snapshot.change24h) ? `${snapshot.change24h.toFixed(2)}%` : 'N/A';
-  const c7d = Number.isFinite(snapshot.change7d) ? `${snapshot.change7d.toFixed(2)}%` : 'N/A';
+  const price  = Number.isFinite(snapshot.price)    ? `$${snapshot.price.toLocaleString('en-US')}` : 'N/A';
+  const c1h    = Number.isFinite(snapshot.change1h)  ? `${snapshot.change1h.toFixed(2)}%`  : 'N/A';
+  const c24h   = Number.isFinite(snapshot.change24h) ? `${snapshot.change24h.toFixed(2)}%` : 'N/A';
+  const c7d    = Number.isFinite(snapshot.change7d)  ? `${snapshot.change7d.toFixed(2)}%`  : 'N/A';
   const volume = Number.isFinite(snapshot.volume24h) ? `$${snapshot.volume24h.toLocaleString('en-US')}` : 'N/A';
-
   return [
     `*${snapshot.symbol} Price Snapshot*`,
     `━━━━━━━━━━━━━━━━━━━━`,
@@ -229,8 +277,8 @@ function addSpikeAlert(chatId, coinInput, threshold = DEFAULT_SPIKE_PERCENT) {
     lastPrice: null,
     lastNotifiedAt: 0,
   };
-  const alerts = alertsByChat.get(chatId) || [];
-  const filtered = alerts.filter(alert => alert.coinId !== coinId);
+  const alerts  = alertsByChat.get(chatId) || [];
+  const filtered = alerts.filter(a => a.coinId !== coinId);
   filtered.push(item);
   alertsByChat.set(chatId, filtered);
   return item;
@@ -244,9 +292,9 @@ function formatAlerts(chatId) {
   return [
     '*Active Spike Alerts*',
     '━━━━━━━━━━━━━━━━━━━━',
-    ...alerts.map((alert, index) => {
+    ...alerts.map((alert, i) => {
       const last = alert.lastPrice ? `$${Number(alert.lastPrice).toLocaleString('en-US')}` : 'waiting for first check';
-      return `${index + 1}. *${alert.label}* — ${alert.threshold}% move/check — ${last}`;
+      return `${i + 1}. *${alert.label}* — ${alert.threshold}% move/check — ${last}`;
     }),
   ].join('\n');
 }
@@ -265,6 +313,7 @@ async function handleStart(chatId) {
     `*Commands:*\n` +
     `/btc — Live BTC market snapshot\n` +
     `/price ETH — Price snapshot\n` +
+    `/news BTC — Latest crypto news\n` +
     `/alert SOL 3 — Spike alert at 3% moves\n` +
     `/alerts — Active alerts\n` +
     `/clearalerts — Remove alerts\n` +
@@ -288,11 +337,11 @@ async function handleHelp(chatId) {
     `*Commands:*\n` +
     `/btc — BTC regime snapshot\n` +
     `/price BTC — Coin price snapshot\n` +
+    `/news BTC — Latest news & sentiment\n` +
     `/alert ETH 3 — Alert if ETH moves 3% between checks\n` +
     `/alerts — Show active alerts\n` +
     `/clearalerts — Clear your alerts\n` +
-    `/start — Welcome message`
-    ,
+    `/start — Welcome message`,
     { reply_markup: mainKeyboard() }
   );
 }
@@ -320,6 +369,18 @@ async function handlePrice(chatId, text) {
   }
 }
 
+async function handleNews(chatId, text) {
+  const [, coin = 'bitcoin'] = String(text || '').trim().split(/\s+/);
+  const msg = await sendMessage(chatId, `⏳ Fetching ${coin.toUpperCase()} news...`);
+  try {
+    const news = await fetchCryptoNews(coin, 5);
+    await editMessage(chatId, msg.result.message_id, formatNewsDigest(news, coin.toUpperCase()));
+  } catch (err) {
+    console.error('[bot] /news error:', err.message);
+    await editMessage(chatId, msg.result.message_id, '❌ Could not fetch news. Try again.');
+  }
+}
+
 async function handleAlertCommand(chatId, text) {
   const [, coin, percent] = String(text || '').trim().split(/\s+/);
   if (!coin) {
@@ -327,11 +388,11 @@ async function handleAlertCommand(chatId, text) {
     await sendMessage(chatId, `Send the alert as: BTC 3\n\nSupported quick symbols: ${supportedCoinList()}`);
     return;
   }
-
   const alert = addSpikeAlert(chatId, coin, percent);
-  await sendMessage(chatId, `✅ Spike alert set for *${alert.label}* at *${alert.threshold}%* moves between checks.\n\nI check about every ${Math.round(ALERT_CHECK_MS / 1000)} seconds.`, {
-    reply_markup: mainKeyboard(),
-  });
+  await sendMessage(chatId,
+    `✅ Spike alert set for *${alert.label}* at *${alert.threshold}%* moves between checks.\n\nI check about every ${Math.round(ALERT_CHECK_MS / 1000)} seconds.`,
+    { reply_markup: mainKeyboard() }
+  );
 }
 
 async function handlePendingText(chatId, text) {
@@ -346,9 +407,10 @@ async function handlePendingText(chatId, text) {
       return true;
     }
     const alert = addSpikeAlert(chatId, coin, percent);
-    await sendMessage(chatId, `✅ Spike alert set for *${alert.label}* at *${alert.threshold}%* moves between checks.`, {
-      reply_markup: mainKeyboard(),
-    });
+    await sendMessage(chatId,
+      `✅ Spike alert set for *${alert.label}* at *${alert.threshold}%* moves between checks.`,
+      { reply_markup: mainKeyboard() }
+    );
     return true;
   }
 
@@ -356,20 +418,14 @@ async function handlePendingText(chatId, text) {
 }
 
 async function handleCallback(query) {
-  const chatId = query.message?.chat?.id;
+  const chatId    = query.message?.chat?.id;
   const messageId = query.message?.message_id;
-  const data = query.data || '';
+  const data      = query.data || '';
   if (!chatId) return;
   await answerCallback(query.id);
 
-  if (data === 'btc') {
-    await handleBtc(chatId);
-    return;
-  }
-  if (data === 'help') {
-    await handleHelp(chatId);
-    return;
-  }
+  if (data === 'btc') { await handleBtc(chatId); return; }
+  if (data === 'help') { await handleHelp(chatId); return; }
   if (data === 'alerts') {
     await sendMessage(chatId, formatAlerts(chatId), { reply_markup: mainKeyboard() });
     return;
@@ -396,6 +452,10 @@ async function handleCallback(query) {
   }
   if (data.startsWith('price:')) {
     await handlePrice(chatId, `/price ${data.split(':')[1]}`);
+    return;
+  }
+  if (data.startsWith('news:')) {
+    await handleNews(chatId, `/news ${data.split(':')[1]}`);
     return;
   }
   if (data.startsWith('quickalert:')) {
@@ -433,24 +493,16 @@ async function handlePhoto(chatId, photo) {
       btcPromise,
     ]);
 
-    await editMessage(chatId, statusId, '🤖 Analyzing chart with AI...');
-    let analysis;
-    try {
-      analysis = await analyzeChart(processed.analysisPath, {
-        mimeType: processed.mimeType, ocrText, marketContext, originalImage: processed.metadata,
-      });
-    } catch (geminiErr) {
-      const canUseOpenRouter = Boolean(process.env.OPENROUTER_API_KEY);
-      const isGeminiAuthOrConfig = geminiErr.statusCode === 400 || geminiErr.statusCode === 401 || geminiErr.statusCode === 403;
-      const shouldFallback = canUseOpenRouter && (geminiErr.retryable !== false || geminiErr.statusCode >= 500 || isGeminiAuthOrConfig);
-      if (!shouldFallback) throw geminiErr;
-      console.error('[bot] Gemini failed, trying OpenRouter fallback:', geminiErr.message);
-      await editMessage(chatId, statusId, '⚡ Gemini busy — switching to fallback AI...');
-      analysis = await analyzeChartWithOpenRouter(processed.analysisPath, {
-        mimeType: processed.mimeType, ocrText, marketContext, originalImage: processed.metadata,
-      });
-    }
+    const payload = { mimeType: processed.mimeType, ocrText, marketContext, originalImage: processed.metadata };
+
+    // GPT → Claude → OpenRouter
+    let analysis = await analyzeWithFallbacks(processed.analysisPath, payload, statusId, chatId);
     analysis = addCodexAnalyst(analysis, { ocrText, marketContext });
+
+    // News sentiment enrichment
+    const pair = analysis.metadata?.pair?.split('/')[0]?.toLowerCase() || 'bitcoin';
+    await editMessage(chatId, statusId, '📰 Fetching news sentiment...');
+    analysis = await analyzeWithNews(analysis, pair).catch(() => analysis);
 
     const report = formatAnalysis(analysis, marketContext);
     await tgPost('deleteMessage', { chat_id: chatId, message_id: statusId });
@@ -459,7 +511,7 @@ async function handlePhoto(chatId, photo) {
   } catch (err) {
     console.error('[bot] photo handler error:', err);
     const errText = err.statusCode === 503
-      ? '⚠️ *Both AI providers are temporarily busy.* Please retry in a moment.'
+      ? '⚠️ *All AI providers are temporarily busy.* Please retry in a moment.'
       : `❌ *Analysis failed.* ${err.publicMessage || err.message || 'Make sure the image is a clear chart screenshot and try again.'}`;
     if (statusId) {
       await editMessage(chatId, statusId, errText).catch(() => sendMessage(chatId, errText));
@@ -480,17 +532,11 @@ async function poll() {
     const res  = await fetch(`${API}/getUpdates?timeout=25&offset=${offset}&allowed_updates=["message","callback_query"]`);
     const data = await res.json();
 
-    if (!data.ok) {
-      console.error('[bot] getUpdates error:', data);
-      return;
-    }
+    if (!data.ok) { console.error('[bot] getUpdates error:', data); return; }
 
     for (const update of data.result) {
       offset = update.update_id + 1;
-      if (update.callback_query) {
-        await handleCallback(update.callback_query);
-        continue;
-      }
+      if (update.callback_query) { await handleCallback(update.callback_query); continue; }
 
       const msg = update.message;
       if (!msg) continue;
@@ -502,12 +548,13 @@ async function poll() {
         } else if (msg.text) {
           if (await handlePendingText(chatId, msg.text)) continue;
           const cmd = msg.text.split(' ')[0].toLowerCase();
-          if (cmd === '/start')     await handleStart(chatId);
-          else if (cmd === '/help') await handleHelp(chatId);
-          else if (cmd === '/btc')  await handleBtc(chatId);
-          else if (cmd === '/price') await handlePrice(chatId, msg.text);
-          else if (cmd === '/alert') await handleAlertCommand(chatId, msg.text);
-          else if (cmd === '/alerts') await sendMessage(chatId, formatAlerts(chatId), { reply_markup: mainKeyboard() });
+          if      (cmd === '/start')       await handleStart(chatId);
+          else if (cmd === '/help')        await handleHelp(chatId);
+          else if (cmd === '/btc')         await handleBtc(chatId);
+          else if (cmd === '/price')       await handlePrice(chatId, msg.text);
+          else if (cmd === '/news')        await handleNews(chatId, msg.text);
+          else if (cmd === '/alert')       await handleAlertCommand(chatId, msg.text);
+          else if (cmd === '/alerts')      await sendMessage(chatId, formatAlerts(chatId), { reply_markup: mainKeyboard() });
           else if (cmd === '/clearalerts') {
             alertsByChat.delete(chatId);
             await sendMessage(chatId, '✅ Cleared your spike alerts.', { reply_markup: mainKeyboard() });
@@ -533,7 +580,7 @@ async function checkSpikeAlerts() {
         if (!Number.isFinite(snapshot.price)) continue;
 
         if (alert.lastPrice) {
-          const move = ((snapshot.price - alert.lastPrice) / alert.lastPrice) * 100;
+          const move    = ((snapshot.price - alert.lastPrice) / alert.lastPrice) * 100;
           const absMove = Math.abs(move);
           const cooledDown = Date.now() - alert.lastNotifiedAt > ALERT_CHECK_MS * 2;
           if (absMove >= alert.threshold && cooledDown) {
@@ -550,7 +597,7 @@ async function checkSpikeAlerts() {
         }
 
         alert.lastPrice = snapshot.price;
-        alert.label = snapshot.symbol;
+        alert.label     = snapshot.symbol;
       } catch (err) {
         console.error(`[bot] alert check failed for ${alert.coinId}:`, err.message);
       }
@@ -558,7 +605,7 @@ async function checkSpikeAlerts() {
   }
 }
 
-// ─── Export for server.js ─────────────────────────────────────────────────────
+// ─── Boot ─────────────────────────────────────────────────────────────────────
 
 export function startBot() {
   if (!TOKEN) {
