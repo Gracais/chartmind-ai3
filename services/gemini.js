@@ -1,7 +1,7 @@
 import fs from 'fs/promises';
 import fetch from 'node-fetch';
 
-const GEMINI_MODELS = (process.env.GEMINI_MODELS || process.env.GEMINI_MODEL || 'gemini-2.5-flash,gemini-flash-latest,gemini-2.0-flash-lite')
+const GEMINI_MODELS = (process.env.GEMINI_MODELS || process.env.GEMINI_MODEL || 'gemini-2.5-flash,gemini-flash-latest,gemini-3.1-flash-lite,gemini-2.0-flash-lite')
   .split(',')
   .map((model) => model.trim())
   .filter(Boolean);
