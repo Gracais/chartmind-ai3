@@ -440,10 +440,8 @@ async function handlePhoto(chatId, photo) {
         mimeType: processed.mimeType, ocrText, marketContext, originalImage: processed.metadata,
       });
     } catch (geminiErr) {
-      const canUseOpenRouter = Boolean(process.env.OPENROUTER_API_KEY);
-      const isGeminiAuthOrConfig = geminiErr.statusCode === 400 || geminiErr.statusCode === 401 || geminiErr.statusCode === 403;
-      const shouldFallback = canUseOpenRouter && (geminiErr.retryable !== false || geminiErr.statusCode >= 500 || isGeminiAuthOrConfig);
-      if (!shouldFallback) throw geminiErr;
+      const isTransient = geminiErr.retryable !== false || geminiErr.statusCode >= 500;
+      if (!isTransient) throw geminiErr;
       console.error('[bot] Gemini failed, trying OpenRouter fallback:', geminiErr.message);
       await editMessage(chatId, statusId, '⚡ Gemini busy — switching to fallback AI...');
       analysis = await analyzeChartWithOpenRouter(processed.analysisPath, {
@@ -460,7 +458,7 @@ async function handlePhoto(chatId, photo) {
     console.error('[bot] photo handler error:', err);
     const errText = err.statusCode === 503
       ? '⚠️ *Both AI providers are temporarily busy.* Please retry in a moment.'
-      : `❌ *Analysis failed.* ${err.publicMessage || err.message || 'Make sure the image is a clear chart screenshot and try again.'}`;
+      : '❌ *Analysis failed.* Make sure the image is a clear chart screenshot and try again.';
     if (statusId) {
       await editMessage(chatId, statusId, errText).catch(() => sendMessage(chatId, errText));
     } else {

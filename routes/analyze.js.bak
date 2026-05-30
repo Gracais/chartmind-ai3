@@ -70,13 +70,11 @@ async function runAIAnalysis(imagePath, extraData) {
   } catch (geminiErr) {
     console.error('[analyze] Gemini failed:', geminiErr.publicMessage || geminiErr.message);
 
-    // Fall through when Gemini is busy, rate-limited, or misconfigured and OpenRouter can still analyze.
+    // Only fall through to OpenRouter if Gemini failed due to rate limit / overload / timeout
     const isRetryable = geminiErr.retryable !== false;
     const isTransient  = geminiErr.statusCode === 503 || geminiErr.statusCode === 429 || geminiErr.statusCode === 504 || geminiErr.statusCode === 502;
-    const canUseOpenRouter = Boolean(process.env.OPENROUTER_API_KEY);
-    const isGeminiAuthOrConfig = geminiErr.statusCode === 400 || geminiErr.statusCode === 401 || geminiErr.statusCode === 403;
 
-    if (!canUseOpenRouter || (!isRetryable && !isTransient && !isGeminiAuthOrConfig)) throw geminiErr;
+    if (!isRetryable && !isTransient) throw geminiErr;
 
     // 2. Try OpenRouter (fallback)
     try {
