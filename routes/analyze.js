@@ -3,8 +3,7 @@ import multer from 'multer';
 import fs from 'fs/promises';
 import path from 'path';
 
-import { analyzeChart }                    from '../services/gemini.js';
-import { analyzeChartWithOpenRouter }      from '../services/openrouter.js';
+import { analyzeChart }                    from '../services/huggingface.js';
 import { getBitcoinMarketContext, btcCache } from '../services/marketData.js';
 import { extractChartText }                from '../services/ocr.js';
 import { preprocessChartImage }            from '../services/preprocess.js';
@@ -60,35 +59,15 @@ function withBudget(promise, ms) {
   });
 }
 
-// ── AI provider chain: Gemini → OpenRouter ────────────────────────────────
+// ── AI provider: Hugging Face LLaVA (Free) ────────────────────────────────
 async function runAIAnalysis(imagePath, extraData) {
-  // 1. Try Gemini (primary)
   try {
     const result = await analyzeChart(imagePath, extraData);
-    console.log('[analyze] AI provider: Gemini ✓');
+    console.log('[analyze] AI provider: Hugging Face ✓');
     return result;
-  } catch (geminiErr) {
-    console.error('[analyze] Gemini failed:', geminiErr.publicMessage || geminiErr.message);
-
-    // Fall through when Gemini is busy, rate-limited, or misconfigured and OpenRouter can still analyze.
-    const isRetryable = geminiErr.retryable !== false;
-    const isTransient  = geminiErr.statusCode === 503 || geminiErr.statusCode === 429 || geminiErr.statusCode === 504 || geminiErr.statusCode === 502;
-    const canUseOpenRouter = Boolean(process.env.OPENROUTER_API_KEY);
-    const isGeminiAuthOrConfig = geminiErr.statusCode === 400 || geminiErr.statusCode === 401 || geminiErr.statusCode === 403;
-
-    if (!canUseOpenRouter || (!isRetryable && !isTransient && !isGeminiAuthOrConfig)) throw geminiErr;
-
-    // 2. Try OpenRouter (fallback)
-    try {
-      console.log('[analyze] Falling back to OpenRouter...');
-      const result = await analyzeChartWithOpenRouter(imagePath, extraData);
-      console.log('[analyze] AI provider: OpenRouter ✓');
-      return result;
-    } catch (orErr) {
-      console.error('[analyze] OpenRouter also failed:', orErr.message);
-      // Re-throw original Gemini error (more meaningful to caller)
-      throw geminiErr;
-    }
+  } catch (error) {
+    console.error('[analyze] Hugging Face failed:', error.publicMessage || error.message);
+    throw error;
   }
 }
 
@@ -104,10 +83,10 @@ function createFallbackAnalysis({ ocrText, marketContext, reason }) {
     },
     confidence: 15,
     warnings: [
-      reason || 'Both AI providers unavailable. This is a fallback report.',
+      reason || 'AI provider is temporarily unavailable.',
       'No trade should be taken from fallback mode alone.',
     ],
-    summary: 'ChartMind processed the upload and market context, but both AI providers (Gemini + OpenRouter) could not complete visual chart reasoning. Please retry shortly.',
+    summary: 'ChartMind processed the upload and market context, but the AI provider could not complete visual chart reasoning. Please retry shortly.',
     keyObservations: [
       ocrText ? 'OCR extracted chart text for the next full analysis attempt.' : 'OCR did not extract enough chart text.',
       `BTC market regime context is ${marketContext?.trend || 'unknown'}.`,
